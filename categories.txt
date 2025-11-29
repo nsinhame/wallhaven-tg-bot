@@ -1,0 +1,25 @@
+# Wallhaven Categories Configuration
+# Format: category_name: search_term1, search_term2, search_term3
+# Lines starting with # are comments and will be ignored
+# Empty lines are also ignored
+
+# Nature category
+nature: tree, water, river, sky, mountain, forest, ocean, sunset, landscape
+
+# Vehicle category
+vehicle: car, bike, racing, motorcycle, truck, sports car
+
+# Anime category
+anime: anime, cartoon, digital art, computer generated image, cgi, manga
+
+# Technology category
+technology: computer, laptop, smartphone, gadget, robot, circuit, code
+
+# Space category
+space: galaxy, planet, stars, nebula, cosmos, astronaut, moon
+
+# Architecture category
+architecture: building, city, skyline, modern, skyscraper, bridge
+
+# Abstract category
+abstract: pattern, geometric, minimalist, colorful, shapes, texture

@@ -6,15 +6,20 @@ Wallhaven to MongoDB Link Uploader (SFW)
 Description: Fetches portrait wallpaper links from Wallhaven.cc
              and uploads them to MongoDB with SFW filters
 
-Usage: python up-link-db-sfw.py [search_query] [count]
-       Example: python up-link-db-sfw.py "nature" 100
+Usage: python up-link-db-sfw.py
 
-Parameters:
-    search_query - Search query/category (optional, defaults to "anime")
-    count - Number of wallpapers to fetch (optional, defaults to 50)
+Configuration:
+    - categories.txt: Define categories and search terms
+      Format: category_name: search_term1, search_term2, search_term3
+      Example:
+        nature: tree, water, river, sky
+        vehicle: car, bike, racing
+        anime: anime, cartoon, digital art
+    
+    - mongodb-uri.txt: Your MongoDB connection string
 
-MongoDB URI: Place your MongoDB connection string in 'mongodb-uri.txt'
-             or set MONGODB_URI environment variable
+The script processes each category line by line, performing searches for
+each search term and storing results with the corresponding category.
 """
 
 import sys
@@ -26,7 +31,7 @@ from datetime import datetime
 import time
 
 # Rate limiting configuration
-MAX_REQUESTS_PER_MINUTE = 45
+MAX_REQUESTS_PER_MINUTE = 40  # Set to 40 for safety (API limit is 45)
 api_call_times = []  # Track timestamps of API calls
 
 def enforce_rate_limit():
@@ -73,6 +78,48 @@ def fetch_wallpaper_tags(wallpaper_id):
         print(f"    ⚠ Could not fetch tags for {wallpaper_id}: {e}")
         return []
 
+def parse_categories_file():
+    """Parse categories.txt file and return list of (category, search_terms) tuples"""
+    if not os.path.exists('categories.txt'):
+        print("Error: categories.txt file not found!")
+        print("Please create categories.txt with format:")
+        print("  category_name: search_term1, search_term2, search_term3")
+        print("Example:")
+        print("  nature: tree, water, river, sky")
+        print("  vehicle: car, bike, racing")
+        sys.exit(1)
+    
+    categories = []
+    with open('categories.txt', 'r', encoding='utf-8') as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            # Skip empty lines and comments
+            if not line or line.startswith('#'):
+                continue
+            
+            # Parse line: category: term1, term2, term3
+            if ':' not in line:
+                print(f"Warning: Skipping invalid line {line_num}: {line}")
+                continue
+            
+            category, terms_str = line.split(':', 1)
+            category = category.strip()
+            
+            # Split search terms by comma and strip whitespace
+            search_terms = [term.strip() for term in terms_str.split(',') if term.strip()]
+            
+            if not category or not search_terms:
+                print(f"Warning: Skipping invalid line {line_num}: {line}")
+                continue
+            
+            categories.append((category, search_terms))
+    
+    if not categories:
+        print("Error: No valid categories found in categories.txt!")
+        sys.exit(1)
+    
+    return categories
+
 def get_mongodb_uri():
     """Get MongoDB URI from file or environment variable"""
     # Try to read from file first
@@ -100,31 +147,8 @@ def get_mongodb_uri():
     return uri
 
 def main():
-    # Get search query from command line argument or prompt user
-    if len(sys.argv) > 1:
-        query = sys.argv[1]
-    else:
-        query = input("Search Wallhaven (category): ").strip()
-        if not query:
-            query = "anime"  # Default to "anime" if user presses Enter
-    
-    # Get number of wallpapers to fetch from argument or prompt user
-    # If not specified, fetch ALL wallpapers
-    max_count = None  # None means fetch all available
-    if len(sys.argv) > 2:
-        try:
-            max_count = int(sys.argv[2])
-        except ValueError:
-            print("Error: Count must be a number")
-            sys.exit(1)
-    else:
-        count_input = input("How many wallpapers to fetch (press Enter for ALL): ").strip()
-        if count_input:
-            try:
-                max_count = int(count_input)
-            except ValueError:
-                print("Error: Count must be a number")
-                sys.exit(1)
+    # Parse categories from categories.txt file
+    categories = parse_categories_file()
     
     # Get MongoDB URI
     mongodb_uri = get_mongodb_uri()
@@ -147,10 +171,6 @@ def main():
         print(f"Error: Failed to connect to MongoDB: {e}")
         sys.exit(1)
     
-    # Clean up query for URL encoding
-    # Remove # symbols
-    search_query = query.replace('#', '')
-    
     # Add exclusion tags to filter out NSFW/inappropriate content
     # Each tag with "-" prefix means "exclude wallpapers with this tag"
     exclusions = [
@@ -166,36 +186,49 @@ def main():
         "-hentai", "-ass", "-asses", "-booty", "-booties",
         "-sideboob", "-sideboobs", "-underboob", "-underboobs"
     ]
-    search_query = search_query + " " + " ".join(exclusions)
+    exclusions_str = " " + " ".join(exclusions)
     
-    print(f"Category: {query}")
-    print(f"Searching for: {search_query}")
-    if max_count:
-        print(f"Target: {max_count} wallpapers")
-    else:
-        print(f"Target: ALL available wallpapers")
-    print()
+    # Global statistics
+    total_added = 0
+    total_duplicates = 0
+    total_errors = 0
     
-    # Initialize counters
-    count = 0  # Number of wallpapers successfully added
-    duplicates = 0  # Number of duplicates skipped
-    errors = 0  # Number of errors
-    page = 1   # Current API page number
-    
-    # API endpoint and parameters
-    api_url = "https://wallhaven.cc/api/v1/search"
-    params = {
-        "q": search_query,
-        "categories": "110",  # General + Anime
-        "purity": "100",      # SFW only
-        "ratios": "portrait",
-        "sorting": "views",
-        "order": "desc",
-        "page": page
-    }
-    
-    # Main fetch loop - continues until we have the requested number of wallpapers (or all if max_count is None)
-    while max_count is None or count < max_count:
+    # Process each category from categories.txt
+    for category_index, (category, search_terms) in enumerate(categories, 1):
+        print("=" * 70)
+        print(f"CATEGORY [{category_index}/{len(categories)}]: {category}")
+        print(f"Search terms: {', '.join(search_terms)}")
+        print("=" * 70)
+        print()
+        
+        # Process each search term for this category
+        for term_index, search_term in enumerate(search_terms, 1):
+            print(f"\n--- Processing: {category} -> {search_term} [{term_index}/{len(search_terms)}] ---\n")
+            
+            # Clean up search term for URL encoding
+            search_query = search_term.replace('#', '')
+            search_query = search_query + exclusions_str
+            
+            # Initialize counters for this search term
+            count = 0
+            duplicates = 0
+            errors = 0
+            page = 1
+            
+            # API endpoint and parameters
+            api_url = "https://wallhaven.cc/api/v1/search"
+            params = {
+                "q": search_query,
+                "categories": "110",  # General + Anime
+                "purity": "100",      # SFW only
+                "ratios": "portrait",
+                "sorting": "views",
+                "order": "desc",
+                "page": page
+            }
+            
+            # Fetch all wallpapers for this search term
+            while True:
         # Update page parameter
         params["page"] = page
         
@@ -216,83 +249,83 @@ def main():
                 print("No more wallpapers found.")
                 break
             
-            # Process each wallpaper from the current page
-            for wallpaper in wallpapers:
-                # Stop if we've reached the requested number (skip check if max_count is None)
-                if max_count is not None and count >= max_count:
-                    break
-                
-                # Extract required data
-                wallpaper_id = wallpaper.get("id", "")
-                wallpaper_url = wallpaper.get("url", "")  # Page URL
-                jpg_url = wallpaper.get("path", "")        # Image URL
-                
-                if not wallpaper_url or not jpg_url:
-                    errors += 1
-                    continue
-                
-                # Fetch tags from individual wallpaper endpoint
-                print(f"[{count + 1}] Fetching tags for {wallpaper_id}...")
-                tags = fetch_wallpaper_tags(wallpaper_id)
-                
-                # Prepare document for MongoDB
-                # Use Unix epoch timestamp (seconds since 1970-01-01 00:00:00 UTC)
-                current_timestamp = int(time.time())
-                
-                document = {
-                    "wallpaper_id": wallpaper_id,
-                    "category": query,
-                    "wallpaper_url": wallpaper_url,
-                    "jpg_url": jpg_url,
-                    "tags": tags,
-                    "sfw": True,  # SFW script only fetches safe content
-                    "status": "link_added",
-                    "sha256": None,
-                    "phash": None,
-                    "tg_response": {},
-                    "created_at": current_timestamp
-                }
-                
-                try:
-                    # Insert into MongoDB
-                    collection.insert_one(document)
-                    count += 1
-                    count_display = f"{count}/{max_count}" if max_count else str(count)
-                    tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
-                    print(f"[{count_display}] ✓ Added: {wallpaper_id}{tag_info}")
-                
-                except DuplicateKeyError:
-                    duplicates += 1
-                    count_display = f"{count}/{max_count}" if max_count else str(count)
-                    print(f"[{count_display}] ⊘ Duplicate: {wallpaper_id}")
-                
-                except Exception as e:
-                    errors += 1
-                    count_display = f"{count}/{max_count}" if max_count else str(count)
-                    print(f"[{count_display}] ✗ Error adding {wallpaper_id}: {e}")
+                # Process each wallpaper from the current page
+                for wallpaper in wallpapers:
+                    # Extract required data
+                    wallpaper_id = wallpaper.get("id", "")
+                    wallpaper_url = wallpaper.get("url", "")  # Page URL
+                    jpg_url = wallpaper.get("path", "")        # Image URL
+                    
+                    if not wallpaper_url or not jpg_url:
+                        errors += 1
+                        continue
+                    
+                    # Fetch tags from individual wallpaper endpoint
+                    print(f"  [{count + 1}] Fetching tags for {wallpaper_id}...")
+                    tags = fetch_wallpaper_tags(wallpaper_id)
+                    
+                    # Prepare document for MongoDB
+                    # Use Unix epoch timestamp (seconds since 1970-01-01 00:00:00 UTC)
+                    current_timestamp = int(time.time())
+                    
+                    document = {
+                        "wallpaper_id": wallpaper_id,
+                        "category": category,  # Use category from categories.txt
+                        "search_term": search_term,  # Store the search term used
+                        "wallpaper_url": wallpaper_url,
+                        "jpg_url": jpg_url,
+                        "tags": tags,
+                        "sfw": True,  # SFW script only fetches safe content
+                        "status": "link_added",
+                        "sha256": None,
+                        "phash": None,
+                        "tg_response": {},
+                        "created_at": current_timestamp
+                    }
+                    
+                    try:
+                        # Insert into MongoDB
+                        collection.insert_one(document)
+                        count += 1
+                        tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
+                        print(f"  [{count}] ✓ Added: {wallpaper_id}{tag_info}")
+                    
+                    except DuplicateKeyError:
+                        duplicates += 1
+                        print(f"  [{count}] ⊘ Duplicate: {wallpaper_id}")
+                    
+                    except Exception as e:
+                        errors += 1
+                        print(f"  [{count}] ✗ Error adding {wallpaper_id}: {e}")
             
-            # Exit loop if we've successfully added the requested number (skip check if max_count is None)
-            if max_count is not None and count >= max_count:
+                # Move to next page for more results
+                page += 1
+            
+            except requests.exceptions.RequestException as e:
+                print(f"  Error fetching search results: {e}")
                 break
-            
-            # Move to next page for more results
-            page += 1
         
-        except requests.exceptions.RequestException as e:
-            print(f"Error fetching search results: {e}")
-            break
+            # Summary for this search term
+            total_added += count
+            total_duplicates += duplicates
+            total_errors += errors
+            
+            print(f"\n  Search term '{search_term}' complete: {count} added, {duplicates} duplicates, {errors} errors")
+            print()
     
     # Close MongoDB connection
     client.close()
     
-    # Final summary
+    # Final summary for all categories
     print()
-    print("=" * 50)
-    print(f"Upload complete!")
-    print(f"✓ Added: {count} wallpapers")
-    print(f"⊘ Duplicates: {duplicates}")
-    print(f"✗ Errors: {errors}")
-    print("=" * 50)
+    print("=" * 70)
+    print("FINAL SUMMARY")
+    print("=" * 70)
+    print(f"Total categories processed: {len(categories)}")
+    print(f"✓ Total added: {total_added} wallpapers")
+    print(f"⊘ Total duplicates: {total_duplicates}")
+    print(f"✗ Total errors: {total_errors}")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
