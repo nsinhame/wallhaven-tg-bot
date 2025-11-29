@@ -14,7 +14,7 @@ Parameters:
     count - Number of wallpapers to fetch (optional, defaults to 50)
 
 Setup:
-    - MongoDB URI: Place in 'mongodb_uri.txt' or set MONGODB_URI env variable
+    - MongoDB URI: Place in 'mongodb-uri.txt' or set MONGODB_URI env variable
     - API Key: Place your Wallhaven API key in 'wallhaven-api.txt'
               Get it from https://wallhaven.cc/settings/account
 """
@@ -30,8 +30,8 @@ import time
 def get_mongodb_uri():
     """Get MongoDB URI from file or environment variable"""
     # Try to read from file first
-    if os.path.exists('mongodb_uri.txt'):
-        with open('mongodb_uri.txt', 'r') as f:
+    if os.path.exists('mongodb-uri.txt'):
+        with open('mongodb-uri.txt', 'r') as f:
             uri = f.read().strip()
             if uri:
                 return uri
@@ -48,7 +48,7 @@ def get_mongodb_uri():
         sys.exit(1)
     
     # Save to file for future use
-    with open('mongodb_uri.txt', 'w') as f:
+    with open('mongodb-uri.txt', 'w') as f:
         f.write(uri)
     
     return uri
@@ -109,6 +109,10 @@ def main():
         client.admin.command('ping')
         db = client['wallpaper-bot']
         collection = db.wallpapers
+        
+        # Create unique index on wallpaper_id to prevent duplicates
+        collection.create_index("wallpaper_id", unique=True)
+        
         print("✓ Connected to MongoDB")
         print()
     except ConnectionFailure as e:
@@ -192,8 +196,8 @@ def main():
                 wallpaper_id = wallpaper.get("id", "")
                 wallpaper_url = wallpaper.get("url", "")  # Page URL
                 jpg_url = wallpaper.get("path", "")        # Image URL
-                tags = [tag.get("name", "") for tag in wallpaper.get("tags", [])]
                 purity = wallpaper.get("purity", "sfw")    # sfw/sketchy/nsfw
+                # Note: Tags are not available in search API, only in individual wallpaper info API
                 
                 if not wallpaper_url or not jpg_url:
                     errors += 1
@@ -203,26 +207,29 @@ def main():
                 # sfw field: True if purity is "sfw", False for "sketchy" or "nsfw"
                 is_sfw = (purity == "sfw")
                 
+                # Use Unix epoch timestamp (seconds since 1970-01-01 00:00:00 UTC)
+                current_timestamp = int(time.time())
+                
                 document = {
                     "wallpaper_id": wallpaper_id,
                     "category": query,
                     "wallpaper_url": wallpaper_url,
                     "jpg_url": jpg_url,
-                    "tags": tags,
+                    "tags": [],  # Tags not available in search API response
                     "purity": purity,  # Keep purity for detailed tracking
                     "sfw": is_sfw,  # Boolean field: True for SFW, False for NSFW/Sketchy
                     "status": "link_added",
                     "sha256": None,
                     "phash": None,
                     "tg_response": {},
-                    "created_at": datetime.utcnow()
+                    "created_at": current_timestamp
                 }
                 
                 try:
                     # Insert into MongoDB
                     collection.insert_one(document)
                     count += 1
-                    print(f"[{count}/{max_count}] ✓ Added: {wallpaper_id} ({purity}) - {len(tags)} tags")
+                    print(f"[{count}/{max_count}] ✓ Added: {wallpaper_id} ({purity})")
                 
                 except DuplicateKeyError:
                     duplicates += 1
