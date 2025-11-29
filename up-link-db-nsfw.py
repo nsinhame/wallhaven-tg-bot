@@ -27,6 +27,55 @@ import requests
 from datetime import datetime
 import time
 
+# Rate limiting configuration
+MAX_REQUESTS_PER_MINUTE = 45
+api_call_times = []  # Track timestamps of API calls
+
+def enforce_rate_limit():
+    """Enforce rate limiting: max 45 requests per minute with safety buffer"""
+    global api_call_times
+    current_time = time.time()
+    
+    # Remove timestamps older than 60 seconds
+    api_call_times = [t for t in api_call_times if current_time - t < 60]
+    
+    # If we've made 45+ calls in the last 60 seconds, wait
+    if len(api_call_times) >= MAX_REQUESTS_PER_MINUTE:
+        oldest_call = api_call_times[0]
+        wait_time = 60 - (current_time - oldest_call) + 2  # 2 second safety buffer
+        if wait_time > 0:
+            print(f"⏱ Rate limit: Waiting {wait_time:.1f}s...")
+            time.sleep(wait_time)
+            # Clean up old timestamps after waiting
+            current_time = time.time()
+            api_call_times = [t for t in api_call_times if current_time - t < 60]
+    
+    # Record this API call
+    api_call_times.append(time.time())
+
+def fetch_wallpaper_tags(wallpaper_id, api_key):
+    """Fetch detailed wallpaper info including tags from individual wallpaper endpoint"""
+    enforce_rate_limit()
+    
+    try:
+        url = f"https://wallhaven.cc/api/v1/w/{wallpaper_id}"
+        params = {"apikey": api_key}
+        response = requests.get(url, params=params, timeout=10)
+        response.raise_for_status()
+        data = response.json()
+        
+        # Extract tags from response
+        wallpaper_data = data.get("data", {})
+        tags_list = wallpaper_data.get("tags", [])
+        
+        # Extract just the tag names
+        tag_names = [tag.get("name", "") for tag in tags_list if tag.get("name")]
+        
+        return tag_names
+    except Exception as e:
+        print(f"    ⚠ Could not fetch tags for {wallpaper_id}: {e}")
+        return []
+
 def get_mongodb_uri():
     """Get MongoDB URI from file or environment variable"""
     # Try to read from file first
@@ -88,6 +137,8 @@ def main():
             query = "anime"  # Default to "anime" if user presses Enter
     
     # Get number of wallpapers to fetch from argument or prompt user
+    # If not specified, fetch ALL wallpapers
+    max_count = None  # None means fetch all available
     if len(sys.argv) > 2:
         try:
             max_count = int(sys.argv[2])
@@ -95,8 +146,13 @@ def main():
             print("Error: Count must be a number")
             sys.exit(1)
     else:
-        count_input = input("How many wallpapers to fetch (default 50): ").strip()
-        max_count = int(count_input) if count_input else 50
+        count_input = input("How many wallpapers to fetch (press Enter for ALL): ").strip()
+        if count_input:
+            try:
+                max_count = int(count_input)
+            except ValueError:
+                print("Error: Count must be a number")
+                sys.exit(1)
     
     # Get MongoDB URI
     mongodb_uri = get_mongodb_uri()
@@ -108,7 +164,7 @@ def main():
         # Test connection
         client.admin.command('ping')
         db = client['wallpaper-bot']
-        collection = db.wallpapers
+        collection = db.wallhaven
         
         # Create unique index on wallpaper_id to prevent duplicates
         collection.create_index("wallpaper_id", unique=True)
@@ -125,6 +181,10 @@ def main():
     
     print(f"Category: {query}")
     print(f"Searching for: {search_query}")
+    if max_count:
+        print(f"Target: {max_count} wallpapers")
+    else:
+        print(f"Target: ALL available wallpapers")
     print()
     
     # Initialize counters
@@ -132,8 +192,6 @@ def main():
     duplicates = 0  # Number of duplicates skipped
     errors = 0  # Number of errors
     page = 1   # Current API page number
-    api_calls = 0  # Track API calls for rate limiting
-    start_time = time.time()  # Track time for rate limiting
     
     # API endpoint and parameters
     api_url = "https://wallhaven.cc/api/v1/search"
@@ -148,29 +206,13 @@ def main():
         "apikey": api_key
     }
     
-    # Main fetch loop - continues until we have the requested number of wallpapers
-    while count < max_count:
+    # Main fetch loop - continues until we have the requested number of wallpapers (or all if max_count is None)
+    while max_count is None or count < max_count:
         # Update page parameter
         params["page"] = page
         
-        # Rate limiting: Max 45 API calls per minute
-        api_calls += 1
-        if api_calls > 1:
-            # Calculate time elapsed and sleep if necessary
-            elapsed_time = time.time() - start_time
-            if elapsed_time < 60:
-                # If we've made 45 calls in less than 60 seconds, wait
-                if api_calls > 45:
-                    sleep_time = 60 - elapsed_time + 1  # Add 1 second buffer
-                    print(f"Rate limit: Waiting {sleep_time:.1f}s before next request...")
-                    time.sleep(sleep_time)
-                    # Reset counters
-                    api_calls = 1
-                    start_time = time.time()
-            else:
-                # More than 60 seconds passed, reset counters
-                api_calls = 1
-                start_time = time.time()
+        # Enforce rate limiting before making API call
+        enforce_rate_limit()
         
         try:
             # Make API request to Wallhaven
@@ -188,8 +230,8 @@ def main():
             
             # Process each wallpaper from the current page
             for wallpaper in wallpapers:
-                # Stop if we've reached the requested number
-                if count >= max_count:
+                # Stop if we've reached the requested number (skip check if max_count is None)
+                if max_count is not None and count >= max_count:
                     break
                 
                 # Extract required data
@@ -197,11 +239,14 @@ def main():
                 wallpaper_url = wallpaper.get("url", "")  # Page URL
                 jpg_url = wallpaper.get("path", "")        # Image URL
                 purity = wallpaper.get("purity", "sfw")    # sfw/sketchy/nsfw
-                # Note: Tags are not available in search API, only in individual wallpaper info API
                 
                 if not wallpaper_url or not jpg_url:
                     errors += 1
                     continue
+                
+                # Fetch tags from individual wallpaper endpoint (with API key for NSFW access)
+                print(f"[{count + 1}] Fetching tags for {wallpaper_id} ({purity})...")
+                tags = fetch_wallpaper_tags(wallpaper_id, api_key)
                 
                 # Prepare document for MongoDB
                 # sfw field: True if purity is "sfw", False for "sketchy" or "nsfw"
@@ -215,7 +260,7 @@ def main():
                     "category": query,
                     "wallpaper_url": wallpaper_url,
                     "jpg_url": jpg_url,
-                    "tags": [],  # Tags not available in search API response
+                    "tags": tags,
                     "purity": purity,  # Keep purity for detailed tracking
                     "sfw": is_sfw,  # Boolean field: True for SFW, False for NSFW/Sketchy
                     "status": "link_added",
@@ -229,18 +274,22 @@ def main():
                     # Insert into MongoDB
                     collection.insert_one(document)
                     count += 1
-                    print(f"[{count}/{max_count}] ✓ Added: {wallpaper_id} ({purity})")
+                    count_display = f"{count}/{max_count}" if max_count else str(count)
+                    tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
+                    print(f"[{count_display}] ✓ Added: {wallpaper_id} ({purity}){tag_info}")
                 
                 except DuplicateKeyError:
                     duplicates += 1
-                    print(f"[{count}/{max_count}] ⊘ Duplicate: {wallpaper_id}")
+                    count_display = f"{count}/{max_count}" if max_count else str(count)
+                    print(f"[{count_display}] ⊘ Duplicate: {wallpaper_id}")
                 
                 except Exception as e:
                     errors += 1
-                    print(f"[{count}/{max_count}] ✗ Error adding {wallpaper_id}: {e}")
+                    count_display = f"{count}/{max_count}" if max_count else str(count)
+                    print(f"[{count_display}] ✗ Error adding {wallpaper_id}: {e}")
             
-            # Exit loop if we've successfully added the requested number
-            if count >= max_count:
+            # Exit loop if we've successfully added the requested number (skip check if max_count is None)
+            if max_count is not None and count >= max_count:
                 break
             
             # Move to next page for more results
