@@ -9,12 +9,12 @@ Description: Fetches portrait wallpaper links from Wallhaven.cc
 Usage: python update-link-db.py
 
 Configuration:
-    - categories.txt: Define categories and search terms
-      Format: category_name: search_term1, search_term2, search_term3
+    - config.txt: Define categories, Telegram groups, intervals, and search terms
+      Format: category | group_id | interval_seconds | search_term1, term2
       Example:
-        nature: tree, water, river, sky
-        vehicle: car, bike, racing
-        anime: anime, cartoon, digital art
+        nature | -1002996780898 | 3050 | tree, water, river, sky
+        vehicle | -1002123456789 | 1200 | car, bike, racing
+        anime | -1002935599065 | 1000 | anime, cartoon, digital art
     
     - mongodb-uri.txt: Your MongoDB connection string
     - wallhaven-api.txt: Your Wallhaven API key
@@ -26,7 +26,7 @@ Database Fields:
     - category: From categories.txt (left side of colon)
     - search_term: The specific search term that found this wallpaper
 
-Note: This script processes all categories and search terms from categories.txt,
+Note: This script processes all categories and search terms from config.txt,
       respecting the 40 requests per minute rate limit. Safe for long-running
       server deployments (4-5 days).
 """
@@ -88,35 +88,41 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
         print(f"    ⚠ Could not fetch tags for {wallpaper_id}: {e}")
         return []
 
-def parse_categories_file():
-    """Parse categories.txt file and return list of (category, search_terms) tuples"""
-    if not os.path.exists('categories.txt'):
-        print("Error: categories.txt file not found!")
-        print("Please create categories.txt with format:")
-        print("  category_name: search_term1, search_term2, search_term3")
+def parse_config_file():
+    """Parse config.txt file and return list of (category, search_terms) tuples"""
+    if not os.path.exists('config.txt'):
+        print("Error: config.txt file not found!")
+        print("Please create config.txt with format:")
+        print("  category | group_id | interval_seconds | search_term1, term2")
         print("Example:")
-        print("  nature: tree, water, river, sky")
-        print("  vehicle: car, bike, racing")
+        print("  nature | -1002996780898 | 3050 | tree, water, river, sky")
+        print("  vehicle | -1002123456789 | 1200 | car, bike, racing")
         sys.exit(1)
     
     categories = []
-    with open('categories.txt', 'r', encoding='utf-8') as f:
+    with open('config.txt', 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             # Skip empty lines and comments
             if not line or line.startswith('#'):
                 continue
             
-            # Parse line: category: term1, term2, term3
-            if ':' not in line:
+            # Parse line: category | group_id | interval | search_terms
+            if '|' not in line:
                 print(f"Warning: Skipping invalid line {line_num}: {line}")
                 continue
             
-            category, terms_str = line.split(':', 1)
-            category = category.strip()
+            parts = line.split('|')
+            if len(parts) != 4:
+                print(f"Warning: Skipping invalid line {line_num} (expected 4 parts): {line}")
+                continue
+            
+            category = parts[0].strip()
+            # group_id and interval are ignored by update-link-db.py
+            search_terms_str = parts[3].strip()
             
             # Split search terms by comma and strip whitespace
-            search_terms = [term.strip() for term in terms_str.split(',') if term.strip()]
+            search_terms = [term.strip() for term in search_terms_str.split(',') if term.strip()]
             
             if not category or not search_terms:
                 print(f"Warning: Skipping invalid line {line_num}: {line}")
@@ -125,7 +131,7 @@ def parse_categories_file():
             categories.append((category, search_terms))
     
     if not categories:
-        print("Error: No valid categories found in categories.txt!")
+        print("Error: No valid categories found in config.txt!")
         sys.exit(1)
     
     return categories
@@ -188,9 +194,9 @@ def main():
     # Get API key from file
     api_key = get_wallhaven_api_key()
     
-    # Parse categories from categories.txt file
-    categories = parse_categories_file()
-    print(f"✓ Loaded {len(categories)} categories from categories.txt")
+    # Parse categories from config.txt file
+    categories = parse_config_file()
+    print(f"✓ Loaded {len(categories)} categories from config.txt")
     
     # Get MongoDB URI
     mongodb_uri = get_mongodb_uri()
