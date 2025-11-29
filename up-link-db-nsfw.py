@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Wallhaven to MongoDB Link Uploader (NSFW + SFW)
+Wallhaven to MongoDB Link Uploader (SFW + Sketchy)
 
 Description: Fetches portrait wallpaper links from Wallhaven.cc
-             and uploads them to MongoDB (includes NSFW content)
+             and uploads them to MongoDB (SFW + Sketchy content only, NO NSFW)
 
 Usage: python up-link-db-nsfw.py [search_query] [count]
        Example: python up-link-db-nsfw.py "nature" 100
@@ -17,6 +17,8 @@ Setup:
     - MongoDB URI: Place in 'mongodb-uri.txt' or set MONGODB_URI env variable
     - API Key: Place your Wallhaven API key in 'wallhaven-api.txt'
               Get it from https://wallhaven.cc/settings/account
+              
+Note: Only SFW content is marked as sfw=True. Sketchy content is marked as sfw=False.
 """
 
 import sys
@@ -114,7 +116,7 @@ def get_wallhaven_api_key():
     # Prompt user
     api_key = input("Enter your Wallhaven API key: ").strip()
     if not api_key:
-        print("Error: API key is required to access NSFW content!")
+        print("Error: API key is required to access Sketchy content!")
         print("Get your API key from: https://wallhaven.cc/settings/account")
         sys.exit(1)
     
@@ -198,7 +200,7 @@ def main():
     params = {
         "q": search_query,
         "categories": "110",  # General + Anime
-        "purity": "111",      # SFW + Sketchy + NSFW
+        "purity": "110",      # SFW + Sketchy (NO NSFW)
         "ratios": "portrait",
         "sorting": "views",
         "order": "desc",
@@ -249,7 +251,7 @@ def main():
                 tags = fetch_wallpaper_tags(wallpaper_id, api_key)
                 
                 # Prepare document for MongoDB
-                # sfw field: True if purity is "sfw", False for "sketchy" or "nsfw"
+                # sfw field: True ONLY if purity is "sfw", False for "sketchy"
                 is_sfw = (purity == "sfw")
                 
                 # Use Unix epoch timestamp (seconds since 1970-01-01 00:00:00 UTC)
@@ -261,8 +263,8 @@ def main():
                     "wallpaper_url": wallpaper_url,
                     "jpg_url": jpg_url,
                     "tags": tags,
-                    "purity": purity,  # Keep purity for detailed tracking
-                    "sfw": is_sfw,  # Boolean field: True for SFW, False for NSFW/Sketchy
+                    "purity": purity,  # Keep purity for detailed tracking (sfw or sketchy only)
+                    "sfw": is_sfw,  # Boolean field: True for SFW only, False for Sketchy
                     "status": "link_added",
                     "sha256": None,
                     "phash": None,

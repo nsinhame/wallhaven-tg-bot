@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 
 """
-Wallhaven Wallpaper Downloader (NSFW + SFW)
+Wallhaven Wallpaper Downloader (SFW + Sketchy)
 
 Description: Downloads portrait wallpapers from Wallhaven.cc
-             including both SFW and NSFW content (requires API key)
+             including SFW and Sketchy content (NO NSFW)
 
 Usage: python dl-wall-nsfw.py [search_query] [count] [api_key]
        Example: python dl-wall-nsfw.py "nature" 10 "your_api_key_here"
@@ -12,7 +12,7 @@ Usage: python dl-wall-nsfw.py [search_query] [count] [api_key]
 Parameters:
     search_query - Search query (optional, defaults to "anime")
     count - Number of wallpapers to download (optional, defaults to 5)
-    api_key - Wallhaven API key (REQUIRED for NSFW content)
+    api_key - Wallhaven API key (required for Sketchy content)
 
 Note: Get your API key from https://wallhaven.cc/settings/account
 """
@@ -30,7 +30,7 @@ def main():
     else:
         api_key = input("Enter your Wallhaven API key: ").strip()
         if not api_key:
-            print("Error: API key is required to access NSFW content!")
+            print("Error: API key is required to access Sketchy content!")
             print("Get your API key from: https://wallhaven.cc/settings/account")
             sys.exit(1)
     
@@ -72,10 +72,10 @@ def main():
     #   - Second digit (1): Anime wallpapers - ENABLED
     #   - Third digit (0): People wallpapers - DISABLED
     #
-    # purity: 111
+    # purity: 110
     #   - First digit (1): SFW (Safe for work) - ENABLED
     #   - Second digit (1): Sketchy - ENABLED
-    #   - Third digit (1): NSFW - ENABLED
+    #   - Third digit (0): NSFW - DISABLED (NO NSFW CONTENT)
     #
     # ratios: portrait
     #   - Only download portrait orientation wallpapers
@@ -92,7 +92,7 @@ def main():
     params = {
         "q": query,
         "categories": "110",
-        "purity": "111",
+        "purity": "110",
         "ratios": "portrait",
         "sorting": "views",
         "order": "desc",
@@ -107,8 +107,8 @@ def main():
         
         try:
             # Make API request to Wallhaven search endpoint with all filters applied
-            # Note: purity=111 includes SFW, Sketchy, and NSFW content
-            # API key is required to access NSFW content
+            # Note: purity=110 includes SFW and Sketchy only (NO NSFW)
+            # API key is required to access Sketchy content
             response = requests.get(api_url, params=params, timeout=10)
             response.raise_for_status()
             data = response.json()

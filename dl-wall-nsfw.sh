@@ -1,10 +1,10 @@
 #!/bin/bash
 
 #################################################################
-# Wallhaven Wallpaper Downloader (NSFW + SFW)
+# Wallhaven Wallpaper Downloader (SFW + Sketchy)
 # 
 # Description: Downloads portrait wallpapers from Wallhaven.cc
-#              including both SFW and NSFW content (requires API key)
+#              including SFW and Sketchy content (NO NSFW)
 #
 # Usage: ./dl-wall-nsfw.sh [search_query] [count] [api_key]
 #        Example: ./dl-wall-nsfw.sh "nature" 10 "your_api_key_here"
@@ -12,7 +12,7 @@
 # Parameters:
 #   $1 - Search query (optional, defaults to "anime")
 #   $2 - Number of wallpapers to download (optional, defaults to 5)
-#   $3 - Wallhaven API key (REQUIRED for NSFW content)
+#   $3 - Wallhaven API key (required for Sketchy content)
 #
 # Note: Get your API key from https://wallhaven.cc/settings/account
 #################################################################
@@ -21,7 +21,7 @@
 if [ -z "$3" ]; then
   read -p "Enter your Wallhaven API key: " api_key
   if [ -z "$api_key" ]; then
-    echo "Error: API key is required to access NSFW content!"
+    echo "Error: API key is required to access Sketchy content!"
     echo "Get your API key from: https://wallhaven.cc/settings/account"
     exit 1
   fi
@@ -64,10 +64,10 @@ page=1        # Current API page number (each page has up to 24 results)
 #   - Second digit (1): Anime wallpapers - ENABLED  
 #   - Third digit (0): People wallpapers - DISABLED
 #
-# purity: 111
+# purity: 110
 #   - First digit (1): SFW (Safe for work) - ENABLED
 #   - Second digit (1): Sketchy - ENABLED
-#   - Third digit (1): NSFW - ENABLED
+#   - Third digit (0): NSFW - DISABLED (NO NSFW CONTENT)
 #
 # ratios: portrait
 #   - Only download portrait orientation wallpapers
@@ -83,9 +83,9 @@ page=1        # Current API page number (each page has up to 24 results)
 while [ $count -lt $max_count ]; do
   
   # Make API request to Wallhaven search endpoint with all filters applied
-  # Note: purity=111 includes SFW, Sketchy, and NSFW content
-  # API key is required to access NSFW content
-  response=$(curl -s "https://wallhaven.cc/api/v1/search?q=$query&categories=110&purity=111&ratios=portrait&sorting=views&order=desc&page=$page&apikey=$api_key")
+  # Note: purity=110 includes SFW and Sketchy only (NO NSFW)
+  # API key is required to access Sketchy content
+  response=$(curl -s "https://wallhaven.cc/api/v1/search?q=$query&categories=110&purity=110&ratios=portrait&sorting=views&order=desc&page=$page&apikey=$api_key")
   
   # Extract image URLs from JSON response
   # 1. grep finds all "path":"url" pairs
