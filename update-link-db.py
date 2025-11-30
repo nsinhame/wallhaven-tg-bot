@@ -132,7 +132,7 @@ def enforce_rate_limit():
     Algorithm:
     1. Get current time
     2. Remove timestamps older than 60 seconds from tracking list
-    3. If we've made 40+ calls in last 60 seconds:
+    3. If we have made 40+ calls in last 60 seconds:
        - Calculate wait time = 60s - (time since oldest call) + 2s buffer
        - Sleep for that duration
        - Clean up tracking list again after waking up
