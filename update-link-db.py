@@ -362,9 +362,9 @@ def get_mongodb_uri():
     4. Save user input to file for future use
     
     File Parsing:
-    • Reads file line by line
-    • Skips empty lines and comments (starting with #)
-    • Returns first valid line
+    - Reads file line by line
+    - Skips empty lines and comments (starting with #)
+    - Returns first valid line
     
     Returns:
         str: MongoDB connection URI
