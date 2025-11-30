@@ -2,6 +2,8 @@
 
 **Automated wallpaper fetching and Telegram posting system with intelligent duplicate detection**
 
+**Note: Most of the code and documentation in this project was generated with AI assistance.**
+
 A sophisticated Python-based automation suite that fetches high-quality portrait wallpapers from Wallhaven.cc, stores metadata in MongoDB, and posts them to category-specific Telegram groups with SHA256 and perceptual hash duplicate detection.
 
 ---
