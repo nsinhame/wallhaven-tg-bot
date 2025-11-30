@@ -1,67 +1,68 @@
 #!/usr/bin/env python3
 
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║                WALLHAVEN TO MONGODB LINK UPLOADER                           ║
-║                                                                              ║
-║  Fetches wallpaper metadata from Wallhaven.cc API and stores in MongoDB      ║
-║  for later processing by tg-up-bot.py. Respects API rate limits and         ║
-║  prevents duplicates.                                                        ║
-║                                                                              ║
-║  CONTENT POLICY: SFW + Sketchy ONLY (NO NSFW)                                ║
-║  This script strictly enforces purity=110 (SFW + Sketchy, NO NSFW)           ║
-║                                                                              ║
-║  KEY FEATURES:                                                               ║
-║  • Multi-category processing from config.txt                                  ║
-║  • Multiple search terms per category                                         ║
-║  • Pagination support (fetches all pages until exhausted)                    ║
-║  • Rate limiting: 40 requests/minute (safety buffer from 45 limit)           ║
-║  • Tag fetching from individual wallpaper endpoint                            ║
-║  • Duplicate prevention via unique index on wallpaper_id                     ║
-║  • Unix epoch timestamps for cross-platform compatibility                    ║
-║                                                                              ║
-║  WORKFLOW:                                                                   ║
-║  1. Load config.txt (categories and search terms)                            ║
-║  2. Connect to MongoDB (database: wallpaper-bot, collection: wallhaven)      ║
-║  3. For each category:                                                       ║
-║     For each search term:                                                    ║
-║       a. Query Wallhaven search API with filters (portrait, SFW+Sketchy)    ║
-║       b. For each wallpaper in results:                                      ║
-║          - Fetch detailed info including tags from /w/<ID> endpoint         ║
-║          - Create document with metadata                                    ║
-║          - Insert into MongoDB (skip if duplicate)                          ║
-║       c. Paginate through all results until no more found                    ║
-║       d. Respect rate limit (40 calls/min with 2s buffer)                    ║
-║  4. Display final statistics                                                 ║
-║                                                                              ║
-║  DATABASE SCHEMA (wallpaper-bot.wallhaven collection):                       ║
-║  {                                                                           ║
-║    wallpaper_id: "abc123"        // Unique Wallhaven ID                      ║
-║    category: "nature"             // From config.txt                         ║
-║    search_term: "mountain"        // Specific term that found this           ║
-║    wallpaper_url: "https://..."   // Wallhaven page URL                      ║
-║    jpg_url: "https://..."         // Direct image URL                        ║
-║    tags: ["landscape", "snow"]    // Array of tag strings                    ║
-║    purity: "sfw"                  // "sfw" or "sketchy" (never "nsfw")       ║
-║    sfw: true                      // Boolean: true=SFW, false=Sketchy        ║
-║    status: "link_added"           // Processing status                        ║
-║    sha256: null                   // Filled by tg-up-bot.py                   ║
-║    phash: null                    // Filled by tg-up-bot.py                   ║
-║    tg_response: {}                // Filled by tg-up-bot.py                   ║
-║    created_at: 1701234567         // Unix epoch timestamp                     ║
-║  }                                                                           ║
-║                                                                              ║
-║  CONFIGURATION FILES:                                                        ║
-║  • config.txt         - Categories and search terms                          ║
-║  • wallhaven-api.txt  - Your Wallhaven API key                               ║
-║  • mongodb-uri.txt    - MongoDB connection string                            ║
-║                                                                              ║
-║  DEPENDENCIES:                                                               ║
-║  pip install pymongo requests                                                ║
-║                                                                              ║
-║  SAFE FOR LONG-RUNNING DEPLOYMENTS (4-5 days on server)                      ║
-║                                                                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+================================================================================
+                WALLHAVEN TO MONGODB LINK UPLOADER
+================================================================================
+
+Fetches wallpaper metadata from Wallhaven.cc API and stores in MongoDB
+for later processing by tg-up-bot.py. Respects API rate limits and
+prevents duplicates.
+
+CONTENT POLICY: SFW + Sketchy ONLY (NO NSFW)
+This script strictly enforces purity=110 (SFW + Sketchy, NO NSFW)
+
+KEY FEATURES:
+- Multi-category processing from config.txt
+- Multiple search terms per category
+- Pagination support (fetches all pages until exhausted)
+- Rate limiting: 40 requests/minute (safety buffer from 45 limit)
+- Tag fetching from individual wallpaper endpoint
+- Duplicate prevention via unique index on wallpaper_id
+- Unix epoch timestamps for cross-platform compatibility
+
+WORKFLOW:
+1. Load config.txt (categories and search terms)
+2. Connect to MongoDB (database: wallpaper-bot, collection: wallhaven)
+3. For each category:
+   For each search term:
+     a. Query Wallhaven search API with filters (portrait, SFW+Sketchy)
+     b. For each wallpaper in results:
+        - Fetch detailed info including tags from /w/<ID> endpoint
+        - Create document with metadata
+        - Insert into MongoDB (skip if duplicate)
+     c. Paginate through all results until no more found
+     d. Respect rate limit (40 calls/min with 2s buffer)
+4. Display final statistics
+
+DATABASE SCHEMA (wallpaper-bot.wallhaven collection):
+{
+  wallpaper_id: "abc123"        // Unique Wallhaven ID
+  category: "nature"             // From config.txt
+  search_term: "mountain"        // Specific term that found this
+  wallpaper_url: "https://..."   // Wallhaven page URL
+  jpg_url: "https://..."         // Direct image URL
+  tags: ["landscape", "snow"]    // Array of tag strings
+  purity: "sfw"                  // "sfw" or "sketchy" (never "nsfw")
+  sfw: true                      // Boolean: true=SFW, false=Sketchy
+  status: "link_added"           // Processing status
+  sha256: null                   // Filled by tg-up-bot.py
+  phash: null                    // Filled by tg-up-bot.py
+  tg_response: {}                // Filled by tg-up-bot.py
+  created_at: 1701234567         // Unix epoch timestamp
+}
+
+CONFIGURATION FILES:
+- config.txt         - Categories and search terms
+- wallhaven-api.txt  - Your Wallhaven API key
+- mongodb-uri.txt    - MongoDB connection string
+
+DEPENDENCIES:
+pip install pymongo requests
+
+SAFE FOR LONG-RUNNING DEPLOYMENTS (4-5 days on server)
+
+================================================================================
 """
 Wallhaven to MongoDB Link Uploader (SFW + Sketchy)
 
@@ -444,50 +445,40 @@ def main():
     Main execution function - orchestrates entire wallpaper fetching workflow.
     
     High-Level Flow:
-    ┌─────────────────────────────────────────────────────────────┐
-    │ 1. Load Configuration                                       │
-    │    • Parse config.txt for categories/terms                   │
-    │    • Load Wallhaven API key                                 │
-    │    • Load MongoDB URI                                        │
-    └─────────────────────────────────────────────────────────────┘
-                              ↓
-    ┌─────────────────────────────────────────────────────────────┐
-    │ 2. Connect to MongoDB                                       │
-    │    • Test connection with ping                              │
-    │    • Create unique index on wallpaper_id                    │
-    └─────────────────────────────────────────────────────────────┘
-                              ↓
-    ┌─────────────────────────────────────────────────────────────┐
-    │ 3. Process Each Category                                    │
-    │    For each search term in category:                        │
-    │    ┌─────────────────────────────────────────────────────┐ │
-    │    │ a. Query Wallhaven search API                       │ │
-    │    │    - Portrait orientation                           │ │
-    │    │    - Purity 110 (SFW + Sketchy, NO NSFW)           │ │
-    │    │    - Categories 110 (General + Anime)               │ │
-    │    │    - Sorted by views (descending)                   │ │
-    │    └─────────────────────────────────────────────────────┘ │
-    │    ┌─────────────────────────────────────────────────────┐ │
-    │    │ b. For each wallpaper in results:                   │ │
-    │    │    - Fetch tags from /w/<ID> endpoint               │ │
-    │    │    - Create MongoDB document                        │ │
-    │    │    - Insert (skip if duplicate wallpaper_id)        │ │
-    │    │    - Respect rate limit (40/min)                    │ │
-    │    └─────────────────────────────────────────────────────┘ │
-    │    ┌─────────────────────────────────────────────────────┐ │
-    │    │ c. Paginate until no more results                   │ │
-    │    │    - Each page has up to 24 wallpapers              │ │
-    │    │    - Increment page number                          │ │
-    │    │    - Stop when API returns empty data array         │ │
-    │    └─────────────────────────────────────────────────────┘ │
-    └─────────────────────────────────────────────────────────────┘
-                              ↓
-    ┌─────────────────────────────────────────────────────────────┐
-    │ 4. Display Final Statistics                                 │
-    │    • Total added                                             │
-    │    • Total duplicates                                        │
-    │    • Total errors                                            │
-    └─────────────────────────────────────────────────────────────┘
+    
+    STEP 1: Load Configuration
+        - Parse config.txt for categories/terms
+        - Load Wallhaven API key
+        - Load MongoDB URI
+    
+    STEP 2: Connect to MongoDB
+        - Test connection with ping
+        - Create unique index on wallpaper_id
+    
+    STEP 3: Process Each Category
+        For each search term in category:
+        
+        a. Query Wallhaven search API
+            - Portrait orientation
+            - Purity 110 (SFW + Sketchy, NO NSFW)
+            - Categories 110 (General + Anime)
+            - Sorted by views (descending)
+        
+        b. For each wallpaper in results:
+            - Fetch tags from /w/<ID> endpoint
+            - Create MongoDB document
+            - Insert (skip if duplicate wallpaper_id)
+            - Respect rate limit (40/min)
+        
+        c. Paginate until no more results
+            - Each page has up to 24 wallpapers
+            - Increment page number
+            - Stop when API returns empty data array
+    
+    STEP 4: Display Final Statistics
+        - Total added
+        - Total duplicates
+        - Total errors
     
     Error Handling Strategy:
     - Configuration errors: Exit immediately (cannot proceed)
@@ -496,9 +487,9 @@ def main():
     - Duplicate key errors: Expected, counted separately
     
     Statistics Tracking:
-    • Global counters: total_added, total_duplicates, total_errors
-    • Per-search-term counters: count, duplicates, errors
-    • Displayed after each search term and at end
+    - Global counters: total_added, total_duplicates, total_errors
+    - Per-search-term counters: count, duplicates, errors
+    - Displayed after each search term and at end
     """
     print("=" * 70)
     print("Wallhaven to MongoDB Link Uploader")
