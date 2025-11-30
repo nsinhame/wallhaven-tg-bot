@@ -133,26 +133,26 @@ def enforce_rate_limit():
     1. Get current time
     2. Remove timestamps older than 60 seconds from tracking list
     3. If we have made 40+ calls in last 60 seconds:
-       - Calculate wait time = 60s - (time since oldest call) + 2s buffer
+       - Calculate wait time equals 60 seconds minus time since oldest call plus 2 second buffer
        - Sleep for that duration
        - Clean up tracking list again after waking up
     4. Record current API call timestamp
     
     Why Sliding Window?
-    • More accurate than fixed time windows
-    • Prevents burst then wait pattern
-    • Smooths out API calls over time
+    - More accurate than fixed time windows
+    - Prevents burst then wait pattern
+    - Smooths out API calls over time
     
     Why 2-Second Buffer?
-    • Accounts for network latency
-    • Accounts for clock synchronization differences
-    • Prevents edge cases where we hit exactly 60s
+    - Accounts for network latency
+    - Accounts for clock synchronization differences
+    - Prevents edge cases where we hit exactly 60 seconds
     
     Example Scenario:
     If we made 40 calls at timestamps [0, 1, 2, ..., 39] seconds:
-    - At 40s, oldest call is at 0s (40 seconds ago)
-    - Wait time = 60 - 40 + 2 = 22 seconds
-    - After 22s wait, oldest call (0s) is now 62s old
+    - At 40 seconds, oldest call is at 0 seconds (40 seconds ago)
+    - Wait time equals 60 minus 40 plus 2 equals 22 seconds
+    - After 22 second wait, oldest call (0 seconds) is now 62 seconds old
     - Gets removed from list, safe to make new call
     
     Global Variables:
@@ -164,7 +164,7 @@ def enforce_rate_limit():
     # Remove timestamps older than 60 seconds
     api_call_times = [t for t in api_call_times if current_time - t < 60]
     
-    # If we've made 40+ calls in the last 60 seconds, wait
+    # If we have made 40+ calls in the last 60 seconds, wait
     if len(api_call_times) >= MAX_REQUESTS_PER_MINUTE:
         oldest_call = api_call_times[0]
         wait_time = 60 - (current_time - oldest_call) + 2  # 2 second safety buffer
@@ -183,17 +183,17 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
     Fetch detailed wallpaper information including tags from Wallhaven API.
     
     Why Separate API Call?
-    • Search endpoint (/api/v1/search) doesn't include full tag list
-    • Individual wallpaper endpoint (/api/v1/w/<ID>) has complete metadata
-    • Tags are valuable for content classification and filtering
+    - Search endpoint (/api/v1/search) does not include full tag list
+    - Individual wallpaper endpoint (/api/v1/w/<ID>) has complete metadata
+    - Tags are valuable for content classification and filtering
     
     API Endpoint:
         GET https://wallhaven.cc/api/v1/w/<wallpaper_id>?apikey=<key>
     
     Why API Key Required?
-    • Some wallpapers are "Sketchy" purity level
-    • Sketchy content requires authentication
-    • Without API key, you only get SFW wallpapers
+    - Some wallpapers are "Sketchy" purity level
+    - Sketchy content requires authentication
+    - Without API key, you only get SFW wallpapers
     
     Response Structure:
         {
@@ -208,15 +208,15 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
         }
     
     Tag Extraction:
-    • Navigate: response["data"]["tags"]
-    • Each tag is a dict with multiple fields
-    • We only need the "name" field
-    • Filter out any tags without names
+    - Navigate: response["data"]["tags"]
+    - Each tag is a dict with multiple fields
+    - We only need the "name" field
+    - Filter out any tags without names
     
     Rate Limiting:
-    • enforce_rate_limit() called BEFORE making request
-    • This ensures we stay within 40 calls/minute
-    • Applies to this endpoint AND search endpoint combined
+    - enforce_rate_limit() called BEFORE making request
+    - This ensures we stay within 40 calls per minute
+    - Applies to this endpoint AND search endpoint combined
     
     Args:
         wallpaper_id (str): Wallhaven wallpaper ID (e.g., "94x38z")
@@ -225,15 +225,15 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
     Returns:
         list of str: Tag names (e.g., ["anime", "landscape", "sunset"])
         Empty list [] if:
-        • API request fails
-        • Response is malformed
-        • Wallpaper has no tags
-        • Network error occurs
+        - API request fails
+        - Response is malformed
+        - Wallpaper has no tags
+        - Network error occurs
     
     Error Handling:
-    • Logs warning but doesn't crash program
-    • Wallpaper is still added to database, just without tags
-    • Better to have wallpaper with no tags than skip entirely
+    - Logs warning but does not crash program
+    - Wallpaper is still added to database, just without tags
+    - Better to have wallpaper with no tags than skip entirely
     """
     enforce_rate_limit()
     
@@ -266,12 +266,12 @@ def parse_config_file():
         nature | -1002996780898 | 3050 | tree, water, mountain, river
     
     What This Function Extracts:
-    • Field 1: category name (e.g., "nature")
-    • Field 4: search terms (e.g., ["tree", "water", "mountain"])
+    - Field 1: category name (e.g., "nature")
+    - Field 4: search terms (e.g., ["tree", "water", "mountain"])
     
     What This Function IGNORES:
-    • Field 2: group_id (only used by tg-up-bot.py)
-    • Field 3: interval (only used by tg-up-bot.py)
+    - Field 2: group_id (only used by tg-up-bot.py)
+    - Field 3: interval (only used by tg-up-bot.py)
     
     Parsing Logic:
     1. Read file line by line
@@ -296,7 +296,7 @@ def parse_config_file():
         ]
     
     Exits:
-        If config.txt doesn't exist or contains no valid categories
+        If config.txt does not exist or contains no valid categories
     
     Example Usage:
         categories = parse_config_file()
@@ -490,10 +490,10 @@ def main():
     └─────────────────────────────────────────────────────────────┘
     
     Error Handling Strategy:
-    • Configuration errors: Exit immediately (can't proceed)
-    • Network errors: Log warning, continue with next item
-    • Database errors: Log error, continue with next item
-    • Duplicate key errors: Expected, counted separately
+    - Configuration errors: Exit immediately (cannot proceed)
+    - Network errors: Log warning, continue with next item
+    - Database errors: Log error, continue with next item
+    - Duplicate key errors: Expected, counted separately
     
     Statistics Tracking:
     • Global counters: total_added, total_duplicates, total_errors
@@ -662,9 +662,9 @@ def main():
                         # Use Unix epoch timestamp for cross-platform compatibility
                         # int(time.time()) returns seconds since 1970-01-01 00:00:00 UTC
                         # Why Unix epoch?
-                        # • No timezone issues
-                        # • Easy to sort and compare
-                        # • Convert to any format later: datetime.fromtimestamp(epoch)
+                        # - No timezone issues
+                        # - Easy to sort and compare
+                        # - Convert to any format later using datetime.fromtimestamp(epoch)
                         current_timestamp = int(time.time())
                         
                         # MongoDB document structure
@@ -679,7 +679,7 @@ def main():
                             "category": category,
                             
                             # Specific search term that found this wallpaper
-                            # Example: category="nature", search_term="mountain"
+                            # Example: category equals nature, search_term equals mountain
                             # Useful for analyzing which terms yield best results
                             "search_term": search_term,
                             
