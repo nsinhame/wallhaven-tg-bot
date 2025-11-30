@@ -283,10 +283,10 @@ def parse_config_file():
     7. Validate both category and search_terms exist
     8. Add to results as tuple: (category, [term1, term2, ...])
     
-    Why Tuples?
-    • Immutable data structure
-    • Clear pairing of category with its terms
-    • Easy to iterate in nested loops
+        Why Tuples?
+        - Immutable data structure
+        - Clear pairing of category with its terms
+        - Easy to iterate in nested loops
     
     Returns:
         list of tuples: [
