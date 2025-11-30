@@ -1,6 +1,68 @@
 #!/usr/bin/env python3
 
 """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                WALLHAVEN TO MONGODB LINK UPLOADER                           ║
+║                                                                              ║
+║  Fetches wallpaper metadata from Wallhaven.cc API and stores in MongoDB      ║
+║  for later processing by tg-up-bot.py. Respects API rate limits and         ║
+║  prevents duplicates.                                                        ║
+║                                                                              ║
+║  CONTENT POLICY: SFW + Sketchy ONLY (NO NSFW)                                ║
+║  This script strictly enforces purity=110 (SFW + Sketchy, NO NSFW)           ║
+║                                                                              ║
+║  KEY FEATURES:                                                               ║
+║  • Multi-category processing from config.txt                                  ║
+║  • Multiple search terms per category                                         ║
+║  • Pagination support (fetches all pages until exhausted)                    ║
+║  • Rate limiting: 40 requests/minute (safety buffer from 45 limit)           ║
+║  • Tag fetching from individual wallpaper endpoint                            ║
+║  • Duplicate prevention via unique index on wallpaper_id                     ║
+║  • Unix epoch timestamps for cross-platform compatibility                    ║
+║                                                                              ║
+║  WORKFLOW:                                                                   ║
+║  1. Load config.txt (categories and search terms)                            ║
+║  2. Connect to MongoDB (database: wallpaper-bot, collection: wallhaven)      ║
+║  3. For each category:                                                       ║
+║     For each search term:                                                    ║
+║       a. Query Wallhaven search API with filters (portrait, SFW+Sketchy)    ║
+║       b. For each wallpaper in results:                                      ║
+║          - Fetch detailed info including tags from /w/<ID> endpoint         ║
+║          - Create document with metadata                                    ║
+║          - Insert into MongoDB (skip if duplicate)                          ║
+║       c. Paginate through all results until no more found                    ║
+║       d. Respect rate limit (40 calls/min with 2s buffer)                    ║
+║  4. Display final statistics                                                 ║
+║                                                                              ║
+║  DATABASE SCHEMA (wallpaper-bot.wallhaven collection):                       ║
+║  {                                                                           ║
+║    wallpaper_id: "abc123"        // Unique Wallhaven ID                      ║
+║    category: "nature"             // From config.txt                         ║
+║    search_term: "mountain"        // Specific term that found this           ║
+║    wallpaper_url: "https://..."   // Wallhaven page URL                      ║
+║    jpg_url: "https://..."         // Direct image URL                        ║
+║    tags: ["landscape", "snow"]    // Array of tag strings                    ║
+║    purity: "sfw"                  // "sfw" or "sketchy" (never "nsfw")       ║
+║    sfw: true                      // Boolean: true=SFW, false=Sketchy        ║
+║    status: "link_added"           // Processing status                        ║
+║    sha256: null                   // Filled by tg-up-bot.py                   ║
+║    phash: null                    // Filled by tg-up-bot.py                   ║
+║    tg_response: {}                // Filled by tg-up-bot.py                   ║
+║    created_at: 1701234567         // Unix epoch timestamp                     ║
+║  }                                                                           ║
+║                                                                              ║
+║  CONFIGURATION FILES:                                                        ║
+║  • config.txt         - Categories and search terms                          ║
+║  • wallhaven-api.txt  - Your Wallhaven API key                               ║
+║  • mongodb-uri.txt    - MongoDB connection string                            ║
+║                                                                              ║
+║  DEPENDENCIES:                                                               ║
+║  pip install pymongo requests                                                ║
+║                                                                              ║
+║  SAFE FOR LONG-RUNNING DEPLOYMENTS (4-5 days on server)                      ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
 Wallhaven to MongoDB Link Uploader (SFW + Sketchy)
 
 Description: Fetches portrait wallpaper links from Wallhaven.cc
@@ -31,20 +93,71 @@ Note: This script processes all categories and search terms from config.txt,
       server deployments (4-5 days).
 """
 
-import sys
-import os
-from pymongo import MongoClient
-from pymongo.errors import DuplicateKeyError, ConnectionFailure
-import requests
-from datetime import datetime
-import time
+# ============================================================================
+# IMPORTS
+# ============================================================================
 
-# Rate limiting configuration
-MAX_REQUESTS_PER_MINUTE = 40  # Set to 40 for safety (API limit is 45)
-api_call_times = []  # Track timestamps of API calls
+# Standard library imports
+import sys              # System operations (exit codes)
+import os               # File system operations (path checks)
+import time             # Time operations (rate limiting, timestamps)
+from datetime import datetime  # Timestamp handling
+
+# Third-party imports
+from pymongo import MongoClient                          # MongoDB Python driver
+from pymongo.errors import DuplicateKeyError, ConnectionFailure  # MongoDB exceptions
+import requests                                          # HTTP client for API requests
+
+# ============================================================================
+# RATE LIMITING CONFIGURATION
+# ============================================================================
+# Note: All configuration loaders (get_mongodb_uri, get_wallhaven_api_key, etc.)
+# automatically skip comment lines (starting with #) and empty lines in files.
+# This allows keeping instructions directly in config files.
+
+# Wallhaven API rate limit: 45 requests per minute
+# We use 40 to provide safety buffer (prevents hitting limit on clock skew)
+# Long-running server deployments benefit from conservative rate limiting
+MAX_REQUESTS_PER_MINUTE = 40
+
+# Rolling window of API call timestamps (Unix epoch seconds)
+# Used to track when each API call was made in the last 60 seconds
+# Example: [1701234567.123, 1701234568.456, ...]
+api_call_times = []
 
 def enforce_rate_limit():
-    """Enforce rate limiting: max 40 requests per minute with safety buffer"""
+    """
+    Enforce API rate limiting using sliding window algorithm.
+    
+    Algorithm:
+    1. Get current time
+    2. Remove timestamps older than 60 seconds from tracking list
+    3. If we've made 40+ calls in last 60 seconds:
+       - Calculate wait time = 60s - (time since oldest call) + 2s buffer
+       - Sleep for that duration
+       - Clean up tracking list again after waking up
+    4. Record current API call timestamp
+    
+    Why Sliding Window?
+    • More accurate than fixed time windows
+    • Prevents burst then wait pattern
+    • Smooths out API calls over time
+    
+    Why 2-Second Buffer?
+    • Accounts for network latency
+    • Accounts for clock synchronization differences
+    • Prevents edge cases where we hit exactly 60s
+    
+    Example Scenario:
+    If we made 40 calls at timestamps [0, 1, 2, ..., 39] seconds:
+    - At 40s, oldest call is at 0s (40 seconds ago)
+    - Wait time = 60 - 40 + 2 = 22 seconds
+    - After 22s wait, oldest call (0s) is now 62s old
+    - Gets removed from list, safe to make new call
+    
+    Global Variables:
+        api_call_times: List of Unix epoch timestamps for recent API calls
+    """
     global api_call_times
     current_time = time.time()
     
@@ -66,7 +179,62 @@ def enforce_rate_limit():
     api_call_times.append(time.time())
 
 def fetch_wallpaper_tags(wallpaper_id, api_key):
-    """Fetch detailed wallpaper info including tags from individual wallpaper endpoint"""
+    """
+    Fetch detailed wallpaper information including tags from Wallhaven API.
+    
+    Why Separate API Call?
+    • Search endpoint (/api/v1/search) doesn't include full tag list
+    • Individual wallpaper endpoint (/api/v1/w/<ID>) has complete metadata
+    • Tags are valuable for content classification and filtering
+    
+    API Endpoint:
+        GET https://wallhaven.cc/api/v1/w/<wallpaper_id>?apikey=<key>
+    
+    Why API Key Required?
+    • Some wallpapers are "Sketchy" purity level
+    • Sketchy content requires authentication
+    • Without API key, you only get SFW wallpapers
+    
+    Response Structure:
+        {
+            "data": {
+                "id": "abc123",
+                "tags": [
+                    {"id": 1, "name": "anime", "alias": "...", ...},
+                    {"id": 2, "name": "landscape", "alias": "...", ...}
+                ],
+                ... other fields ...
+            }
+        }
+    
+    Tag Extraction:
+    • Navigate: response["data"]["tags"]
+    • Each tag is a dict with multiple fields
+    • We only need the "name" field
+    • Filter out any tags without names
+    
+    Rate Limiting:
+    • enforce_rate_limit() called BEFORE making request
+    • This ensures we stay within 40 calls/minute
+    • Applies to this endpoint AND search endpoint combined
+    
+    Args:
+        wallpaper_id (str): Wallhaven wallpaper ID (e.g., "94x38z")
+        api_key (str): Your Wallhaven API key from account settings
+    
+    Returns:
+        list of str: Tag names (e.g., ["anime", "landscape", "sunset"])
+        Empty list [] if:
+        • API request fails
+        • Response is malformed
+        • Wallpaper has no tags
+        • Network error occurs
+    
+    Error Handling:
+    • Logs warning but doesn't crash program
+    • Wallpaper is still added to database, just without tags
+    • Better to have wallpaper with no tags than skip entirely
+    """
     enforce_rate_limit()
     
     try:
@@ -89,7 +257,54 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
         return []
 
 def parse_config_file():
-    """Parse config.txt file and return list of (category, search_terms) tuples"""
+    """
+    Parse config.txt and extract categories with their search terms.
+    
+    File Format:
+        category | group_id | interval_seconds | search_term1, search_term2
+        Example:
+        nature | -1002996780898 | 3050 | tree, water, mountain, river
+    
+    What This Function Extracts:
+    • Field 1: category name (e.g., "nature")
+    • Field 4: search terms (e.g., ["tree", "water", "mountain"])
+    
+    What This Function IGNORES:
+    • Field 2: group_id (only used by tg-up-bot.py)
+    • Field 3: interval (only used by tg-up-bot.py)
+    
+    Parsing Logic:
+    1. Read file line by line
+    2. Skip empty lines and comments (starting with #)
+    3. Split line by '|' delimiter
+    4. Validate 4 parts exist
+    5. Extract category (part 0) and search_terms (part 3)
+    6. Split search_terms by comma, strip whitespace
+    7. Validate both category and search_terms exist
+    8. Add to results as tuple: (category, [term1, term2, ...])
+    
+    Why Tuples?
+    • Immutable data structure
+    • Clear pairing of category with its terms
+    • Easy to iterate in nested loops
+    
+    Returns:
+        list of tuples: [
+            ('nature', ['tree', 'water', 'mountain']),
+            ('anime', ['cartoon', 'manga']),
+            ...
+        ]
+    
+    Exits:
+        If config.txt doesn't exist or contains no valid categories
+    
+    Example Usage:
+        categories = parse_config_file()
+        for category, terms in categories:
+            for term in terms:
+                # Fetch wallpapers for this category/term pair
+                ...
+    """
     if not os.path.exists('config.txt'):
         print("Error: config.txt file not found!")
         print("Please create config.txt with format:")
@@ -137,13 +352,31 @@ def parse_config_file():
     return categories
 
 def get_mongodb_uri():
-    """Get MongoDB URI from file or environment variable"""
+    """
+    Get MongoDB URI from file, environment variable, or user input.
+    
+    Priority Order:
+    1. mongodb-uri.txt file (skips comments and empty lines)
+    2. MONGODB_URI environment variable
+    3. User input (interactive prompt)
+    4. Save user input to file for future use
+    
+    File Parsing:
+    • Reads file line by line
+    • Skips empty lines and comments (starting with #)
+    • Returns first valid line
+    
+    Returns:
+        str: MongoDB connection URI
+    """
     # Try to read from file first
     if os.path.exists('mongodb-uri.txt'):
         with open('mongodb-uri.txt', 'r') as f:
-            uri = f.read().strip()
-            if uri:
-                return uri
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith('#'):
+                    return line
     
     # Try environment variable
     uri = os.getenv('MONGODB_URI')
@@ -163,13 +396,35 @@ def get_mongodb_uri():
     return uri
 
 def get_wallhaven_api_key():
-    """Get Wallhaven API key from file or prompt user"""
+    """
+    Get Wallhaven API key from file or user input.
+    
+    Priority Order:
+    1. wallhaven-api.txt file (skips comments and empty lines)
+    2. User input (interactive prompt)
+    3. Save user input to file for future use
+    
+    File Parsing:
+    • Reads file line by line
+    • Skips empty lines and comments (starting with #)
+    • Returns first valid line as API key
+    
+    Example file content:
+        # Wallhaven API Key
+        # Get from: https://wallhaven.cc/settings/account
+        abc123def456ghi789
+    
+    Returns:
+        str: Wallhaven API key
+    """
     # Try to read from file first
     if os.path.exists('wallhaven-api.txt'):
         with open('wallhaven-api.txt', 'r') as f:
-            api_key = f.read().strip()
-            if api_key:
-                return api_key
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith('#'):
+                    return line
     
     # Prompt user
     api_key = input("Enter your Wallhaven API key: ").strip()
@@ -185,6 +440,66 @@ def get_wallhaven_api_key():
     return api_key
 
 def main():
+    """
+    Main execution function - orchestrates entire wallpaper fetching workflow.
+    
+    High-Level Flow:
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 1. Load Configuration                                       │
+    │    • Parse config.txt for categories/terms                   │
+    │    • Load Wallhaven API key                                 │
+    │    • Load MongoDB URI                                        │
+    └─────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 2. Connect to MongoDB                                       │
+    │    • Test connection with ping                              │
+    │    • Create unique index on wallpaper_id                    │
+    └─────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 3. Process Each Category                                    │
+    │    For each search term in category:                        │
+    │    ┌─────────────────────────────────────────────────────┐ │
+    │    │ a. Query Wallhaven search API                       │ │
+    │    │    - Portrait orientation                           │ │
+    │    │    - Purity 110 (SFW + Sketchy, NO NSFW)           │ │
+    │    │    - Categories 110 (General + Anime)               │ │
+    │    │    - Sorted by views (descending)                   │ │
+    │    └─────────────────────────────────────────────────────┘ │
+    │    ┌─────────────────────────────────────────────────────┐ │
+    │    │ b. For each wallpaper in results:                   │ │
+    │    │    - Fetch tags from /w/<ID> endpoint               │ │
+    │    │    - Create MongoDB document                        │ │
+    │    │    - Insert (skip if duplicate wallpaper_id)        │ │
+    │    │    - Respect rate limit (40/min)                    │ │
+    │    └─────────────────────────────────────────────────────┘ │
+    │    ┌─────────────────────────────────────────────────────┐ │
+    │    │ c. Paginate until no more results                   │ │
+    │    │    - Each page has up to 24 wallpapers              │ │
+    │    │    - Increment page number                          │ │
+    │    │    - Stop when API returns empty data array         │ │
+    │    └─────────────────────────────────────────────────────┘ │
+    └─────────────────────────────────────────────────────────────┘
+                              ↓
+    ┌─────────────────────────────────────────────────────────────┐
+    │ 4. Display Final Statistics                                 │
+    │    • Total added                                             │
+    │    • Total duplicates                                        │
+    │    • Total errors                                            │
+    └─────────────────────────────────────────────────────────────┘
+    
+    Error Handling Strategy:
+    • Configuration errors: Exit immediately (can't proceed)
+    • Network errors: Log warning, continue with next item
+    • Database errors: Log error, continue with next item
+    • Duplicate key errors: Expected, counted separately
+    
+    Statistics Tracking:
+    • Global counters: total_added, total_duplicates, total_errors
+    • Per-search-term counters: count, duplicates, errors
+    • Displayed after each search term and at end
+    """
     print("=" * 70)
     print("Wallhaven to MongoDB Link Uploader")
     print("Fetching SFW + Sketchy content (NO NSFW)")
@@ -245,16 +560,54 @@ def main():
             errors = 0
             page = 1
             
-            # API endpoint and parameters
+            # ============================================================
+            # WALLHAVEN API SEARCH PARAMETERS
+            # ============================================================
+            # Documentation: https://wallhaven.cc/help/api
+            
             api_url = "https://wallhaven.cc/api/v1/search"
             params = {
+                # Search query (with # symbols removed for URL compatibility)
                 "q": search_query,
-                "categories": "110",  # General + Anime (no People)
-                "purity": "110",      # SFW + Sketchy (NO NSFW)
+                
+                # categories: 3-digit binary string
+                # First digit (1): General wallpapers - ENABLED
+                # Second digit (1): Anime wallpapers - ENABLED
+                # Third digit (0): People wallpapers - DISABLED
+                # Result: "110" = General + Anime only
+                "categories": "110",
+                
+                # purity: 3-digit binary string (CRITICAL PARAMETER)
+                # First digit (1): SFW (Safe for Work) - ENABLED
+                # Second digit (1): Sketchy (questionable but not explicit) - ENABLED
+                # Third digit (0): NSFW (Not Safe for Work) - DISABLED
+                # Result: "110" = SFW + Sketchy, NO NSFW
+                # Note: This is enforced by user requirement
+                "purity": "110",
+                
+                # ratios: Aspect ratio filter
+                # "portrait" = height > width (mobile wallpapers)
+                # Other options: "landscape", "16x9", "16x10", etc.
                 "ratios": "portrait",
+                
+                # sorting: How to order results
+                # "views" = most viewed wallpapers first (popular)
+                # Other options: "date_added", "relevance", "random", "favorites"
                 "sorting": "views",
+                
+                # order: Sorting direction
+                # "desc" = descending (highest to lowest)
+                # "asc" = ascending (lowest to highest)
                 "order": "desc",
+                
+                # page: Pagination (1-indexed)
+                # Each page returns up to 24 results
+                # Incremented in loop to fetch all pages
                 "page": page,
+                
+                # apikey: Your Wallhaven API key
+                # Required to access Sketchy content
+                # Without key, only SFW results returned
                 "apikey": api_key
             }
             
@@ -296,26 +649,85 @@ def main():
                         print(f"  [{count + 1}] Fetching tags for {wallpaper_id} ({purity})...")
                         tags = fetch_wallpaper_tags(wallpaper_id, api_key)
                         
-                        # Prepare document for MongoDB
-                        # sfw field: True ONLY if purity is "sfw", False for "sketchy"
+                        # ====================================================
+                        # PREPARE MONGODB DOCUMENT
+                        # ====================================================
+                        
+                        # Calculate sfw boolean field
+                        # True: purity="sfw" (completely safe)
+                        # False: purity="sketchy" (questionable but not explicit)
+                        # This allows easy filtering: db.find({"sfw": true})
                         is_sfw = (purity == "sfw")
                         
-                        # Use Unix epoch timestamp (seconds since 1970-01-01 00:00:00 UTC)
+                        # Use Unix epoch timestamp for cross-platform compatibility
+                        # int(time.time()) returns seconds since 1970-01-01 00:00:00 UTC
+                        # Why Unix epoch?
+                        # • No timezone issues
+                        # • Easy to sort and compare
+                        # • Convert to any format later: datetime.fromtimestamp(epoch)
                         current_timestamp = int(time.time())
                         
+                        # MongoDB document structure
+                        # This matches the schema expected by tg-up-bot.py
                         document = {
+                            # Unique Wallhaven ID (e.g., "94x38z")
+                            # This field has unique index to prevent duplicates
                             "wallpaper_id": wallpaper_id,
-                            "category": category,  # Use category from categories.txt
-                            "search_term": search_term,  # Store the search term used
+                            
+                            # Category from config.txt (e.g., "nature", "anime")
+                            # Used by tg-up-bot.py to determine which Telegram group
+                            "category": category,
+                            
+                            # Specific search term that found this wallpaper
+                            # Example: category="nature", search_term="mountain"
+                            # Useful for analyzing which terms yield best results
+                            "search_term": search_term,
+                            
+                            # Wallhaven page URL (human-readable)
+                            # Example: "https://wallhaven.cc/w/94x38z"
                             "wallpaper_url": wallpaper_url,
+                            
+                            # Direct image URL (for downloading)
+                            # Example: "https://w.wallhaven.cc/full/94/wallhaven-94x38z.jpg"
+                            # This is what tg-up-bot.py downloads
                             "jpg_url": jpg_url,
+                            
+                            # Array of tag strings from Wallhaven
+                            # Example: ["anime", "landscape", "sunset"]
+                            # Fetched from individual wallpaper endpoint
                             "tags": tags,
-                            "purity": purity,  # Keep purity for detailed tracking (sfw or sketchy only)
-                            "sfw": is_sfw,  # Boolean field: True for SFW only, False for Sketchy
+                            
+                            # Purity level string: "sfw" or "sketchy" (never "nsfw")
+                            # Kept for detailed tracking and filtering
+                            "purity": purity,
+                            
+                            # Boolean field for quick SFW filtering
+                            # True: Completely safe (purity="sfw")
+                            # False: Questionable content (purity="sketchy")
+                            # Query example: db.find({"sfw": true})
+                            "sfw": is_sfw,
+                            
+                            # Processing status for tg-up-bot.py workflow
+                            # Status flow:
+                            #   "link_added" → "posted"  (successfully uploaded)
+                            #                → "failed"  (download/upload error)
+                            #                → "skipped" (duplicate detected)
                             "status": "link_added",
+                            
+                            # SHA256 hash (filled by tg-up-bot.py after download)
+                            # Used for exact duplicate detection
                             "sha256": None,
+                            
+                            # Perceptual hash (filled by tg-up-bot.py after download)
+                            # Used for similar image detection
                             "phash": None,
+                            
+                            # Telegram upload response (filled by tg-up-bot.py)
+                            # Contains message IDs, timestamps, group info
                             "tg_response": {},
+                            
+                            # Unix epoch timestamp when added to database
+                            # Seconds since 1970-01-01 00:00:00 UTC
                             "created_at": current_timestamp
                         }
                         

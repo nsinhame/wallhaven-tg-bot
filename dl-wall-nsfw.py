@@ -1,35 +1,116 @@
 #!/usr/bin/env python3
 
 """
-Wallhaven Wallpaper Downloader (SFW + Sketchy)
+═══════════════════════════════════════════════════════════════════════════════
+              WALLHAVEN STANDALONE DOWNLOADER (SFW + SKETCHY)
+═══════════════════════════════════════════════════════════════════════════════
 
-Description: Downloads portrait wallpapers from Wallhaven.cc
-             including SFW and Sketchy content (NO NSFW)
+IMPORTANT NOTE: Despite the filename "nsfw", this script actually downloads
+ONLY SFW + Sketchy content (purity=110), NO actual NSFW content!
 
-Usage: python dl-wall-nsfw.py [search_query] [count] [api_key]
-       Example: python dl-wall-nsfw.py "nature" 10 "your_api_key_here"
+Filename History:
+    Originally named for SFW+Sketchy (which was called "NSFW mode" in early
+    versions). Name kept for backward compatibility but content is safe.
+
+Purpose:
+    Standalone script for direct wallpaper downloads from Wallhaven.cc
+    WITHOUT database integration. Requires API key for Sketchy content.
+
+Key Differences from dl-wall-sfw.py:
+    ✓ Includes Sketchy purity level (purity=110 vs 100)
+    ✓ Requires API key
+    ✗ No additional exclusion tags (relies on purity filter)
+    
+Key Differences from update-link-db.py:
+    ✓ No MongoDB required
+    ✓ Downloads directly to current directory
+    ✓ No metadata storage
+    ✓ Immediate results
+    ✗ No tag fetching (uses search API only)
+    ✗ No duplicate tracking across sessions
+
+Content Policy: SFW + SKETCHY (NO NSFW)
+    • Purity: 110 (SFW + Sketchy, NO actual NSFW)
+    • Requires Wallhaven API key for authentication
+
+Usage:
+    Interactive mode:
+        python dl-wall-nsfw.py
+    
+    Command-line mode:
+        python dl-wall-nsfw.py "nature" 10 "your_api_key"
+        python dl-wall-nsfw.py "anime" 25 "abc123def456"
 
 Parameters:
-    search_query - Search query (optional, defaults to "anime")
-    count - Number of wallpapers to download (optional, defaults to 5)
-    api_key - Wallhaven API key (required for Sketchy content)
+    search_query (optional) - What to search for (default: "anime")
+    count (optional)        - How many to download (default: 5)
+    api_key (required)      - Your Wallhaven API key
 
-Note: Get your API key from https://wallhaven.cc/settings/account
+Get API Key:
+    https://wallhaven.cc/settings/account
+
+Examples:
+    python dl-wall-nsfw.py
+    python dl-wall-nsfw.py "mountain" 20 "myapikey123"
+    python dl-wall-nsfw.py "digital art" 15 "abc123"
+
+Output:
+    Wallpapers saved in current directory:
+        wallhaven-abc123.jpg
+        wallhaven-xyz789.jpg
+
+Dependencies:
+    pip install requests
+
+═══════════════════════════════════════════════════════════════════════════════
 """
 
-import sys
-import os
-import requests
-from pathlib import Path
-from urllib.parse import quote_plus
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import sys              # Command-line arguments and exit codes
+import os               # File operations (check existence, file size, delete)
+import requests         # HTTP client for API requests and image downloads
+from pathlib import Path        # Modern path handling (not actively used but available)
+from urllib.parse import quote_plus  # URL encoding (not actively used but available)
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
 
 def main():
-    # Get API key from command line argument or prompt user
+    """
+    Main execution function for SFW + Sketchy downloader.
+    
+    Workflow:
+    1. Get API key (from args or user input) - REQUIRED!
+    2. Get search query (from args or user input)
+    3. Get count (from args or user input)
+    4. Query Wallhaven search API with authentication
+    5. Download images page by page
+    6. Display progress and final statistics
+    
+    Why API Key Required?
+    • Sketchy content requires authentication
+    • Without API key, Wallhaven returns only SFW results
+    • API key validates your account access level
+    """
+    
+    # ========================================================================
+    # STEP 1: Get API Key (REQUIRED for Sketchy content)
+    # ========================================================================
+    # Priority: Command-line arg > User input > Exit (mandatory)
+    # Unlike SFW version, this is NOT optional!
+    
     if len(sys.argv) > 3:
+        # Command-line argument provided (3rd argument)
         api_key = sys.argv[3]
     else:
+        # Interactive mode - ask user
         api_key = input("Enter your Wallhaven API key: ").strip()
         if not api_key:
+            # Empty input - cannot proceed without API key
             print("Error: API key is required to access Sketchy content!")
             print("Get your API key from: https://wallhaven.cc/settings/account")
             sys.exit(1)

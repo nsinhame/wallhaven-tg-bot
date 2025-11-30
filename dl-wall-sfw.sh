@@ -1,43 +1,125 @@
 #!/bin/bash
 
 #################################################################
-# Wallhaven Wallpaper Downloader
-# 
-# Description: Downloads portrait wallpapers from Wallhaven.cc
-#              with SFW filters and exclusion tags applied
+#          WALLHAVEN STANDALONE SFW DOWNLOADER (BASH)
+#################################################################
 #
-# Usage: ./download_wallpapers.sh [search_query] [count]
-#        Example: ./download_wallpapers.sh "nature" 10
+# Purpose:
+#   Bash version of standalone SFW wallpaper downloader.
+#   No database, no Python - just bash + curl + wget!
+#
+# Why Bash Version?
+#   • Works on systems without Python
+#   • Lightweight and fast
+#   • Easy to run on servers (no dependencies)
+#   • Great for quick testing
+#
+# Key Differences from Python version:
+#   ✓ Same functionality
+#   ✓ Uses curl for API, wget for downloads
+#   ✓ Grep/sed for JSON parsing (no jq required!)
+#   ✗ Simpler error handling
+#   ✗ Less detailed progress info
+#
+# Content Policy: STRICT SFW ONLY
+#   • Purity: 100 (SFW only)
+#   • Exclusion tags for safety
+#   • No API key required
+#
+# Usage:
+#   Interactive mode:
+#     ./dl-wall-sfw.sh
+#   
+#   Command-line mode:
+#     ./dl-wall-sfw.sh "nature" 10
+#     ./dl-wall-sfw.sh "anime landscape" 25
 #
 # Parameters:
 #   $1 - Search query (optional, defaults to "anime")
-#   $2 - Number of wallpapers to download (optional, defaults to 5)
+#   $2 - Download count (optional, defaults to 5)
+#
+# Examples:
+#   ./dl-wall-sfw.sh
+#   ./dl-wall-sfw.sh "mountain"
+#   ./dl-wall-sfw.sh "digital art" 15
+#
+# Requirements:
+#   • curl  (for API requests)
+#   • wget  (for downloading images)
+#   • grep  (for JSON parsing)
+#   • sed   (for text processing)
+#   All usually pre-installed on Linux/macOS
+#
+# Output:
+#   Wallpapers saved in current directory:
+#     wallhaven-abc123.jpg
+#     wallhaven-xyz789.jpg
+#
 #################################################################
 
-# Get search query from command line argument or prompt user
+#################################################################
+# STEP 1: Get Search Query
+#################################################################
+# Bash parameter expansion:
+#   [ -z "$1" ]     = True if $1 is empty (no argument provided)
+#   ${var:-default} = Use 'default' if var is empty
+#
+# Priority: Command-line arg > User input > Default
+
 if [ -z "$1" ]; then
+  # No command-line argument - interactive mode
   read -p "Search Wallhaven: " query
-  query=${query:-anime}  # Default to "anime" if user presses Enter
+  query=${query:-anime}  # If user just pressed Enter, use "anime"
 else
+  # Command-line argument provided - use it
   query="$1"
 fi
 
-# Get number of wallpapers to download from argument or prompt user
+#################################################################
+# STEP 2: Get Download Count
+#################################################################
+# Same logic as query parameter
+
 if [ -z "$2" ]; then
+  # No command-line argument - ask user
   read -p "How many wallpapers to download (default 5): " max_count
-  max_count=${max_count:-5}  # Default to 5 if user presses Enter
+  max_count=${max_count:-5}  # If empty, use 5
 else
+  # Command-line argument provided
   max_count="$2"
 fi
 
+#################################################################
+# STEP 3: Prepare Query with Safety Filters
+#################################################################
+
 # Clean up query for URL encoding
-# Remove # symbols and replace spaces with + for URL compatibility
+# sed 's/#//g'   = Remove all # symbols (they break URLs)
+# sed 's/ /+/g'  = Replace spaces with + for URL encoding
 query=$(echo "$query" | sed 's/#//g' | sed 's/ /+/g')
 
-# Add exclusion tags to filter out NSFW/inappropriate content
-# Each tag with "+-" prefix means "exclude wallpapers with this tag"
-# This comprehensive list includes both singular and plural forms for maximum safety
+#################################################################
+# EXCLUSION TAGS - Content Safety Layer
+#################################################################
+# Why exclusion tags in bash?
+# • Same logic as Python version
+# • purity=100 alone isn't always sufficient
+# • Additional safety filtering for SFW-only downloads
+#
+# Wallhaven tag syntax:
+# • "+-tagname" means "exclude wallpapers tagged with 'tagname'"
+# • Multiple exclusions concatenated with +- separator
+#
+# Example query result:
+#   "nature+-girl+-woman+-sexy"
+#   = Search for "nature" but exclude anything tagged girl/woman/sexy
+#
+# This comprehensive list covers 50+ inappropriate tags!
+#################################################################
+
 exclusions="+-girl+-girls+-woman+-women+-female+-females+-lady+-ladies+-thigh+-thighs+-skirt+-skirts+-bikini+-bikinis+-leg+-legs+-cleavage+-cleavages+-chest+-chests+-breast+-breasts+-butt+-butts+-boob+-boobs+-sexy+-hot+-babe+-babes+-model+-models+-lingerie+-underwear+-panty+-panties+-bra+-bras+-swimsuit+-swimsuits+-dress+-dresses+-schoolgirl+-schoolgirls+-maid+-maids+-waifu+-waifus+-ecchi+-nude+-nudes+-naked+-nsfw+-lewd+-hentai+-ass+-asses+-booty+-booties+-sideboob+-sideboobs+-underboob+-underboobs"
+
+# Append exclusions to query
 query="$query$exclusions"
 
 echo "Searching for: $query"
@@ -76,10 +158,29 @@ while [ $count -lt $max_count ]; do
   # Make API request to Wallhaven search endpoint with all filters applied
   response=$(curl -s "https://wallhaven.cc/api/v1/search?q=$query&categories=110&purity=100&ratios=portrait&sorting=views&order=desc&page=$page")
   
-  # Extract image URLs from JSON response
-  # 1. grep finds all "path":"url" pairs
-  # 2. cut extracts just the URL part
-  # 3. sed removes escaped forward slashes (\/ becomes /)
+  #################################################################
+  # JSON PARSING WITHOUT JQ
+  #################################################################
+  # Why not use jq? To avoid external dependencies!
+  # This grep/cut/sed pipeline parses JSON the old-school way.
+  #
+  # JSON response looks like:
+  # {"data":[{"path":"https://w.wallhaven.cc/full/94/wallhaven-94x38z.jpg"}]}
+  #
+  # Pipeline breakdown:
+  # 1. grep -o '"path":"[^"]*"'
+  #    Finds all "path":"..." patterns
+  #    Output: "path":"https://w.wallhaven.cc/full/94/wallhaven-94x38z.jpg"
+  #
+  # 2. cut -d'"' -f4
+  #    Splits by " delimiter, gets 4th field (the URL)
+  #    Output: https://w.wallhaven.cc/full/94/wallhaven-94x38z.jpg
+  #
+  # 3. sed 's/\\//g'
+  #    Removes escaped forward slashes (\/ becomes /)
+  #    Handles JSON escaping if present
+  #################################################################
+  
   paths=$(echo "$response" | grep -o '"path":"[^"]*"' | cut -d'"' -f4 | sed 's/\\//g')
   
   # Check if we got any results from this page

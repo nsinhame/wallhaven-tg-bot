@@ -1,31 +1,96 @@
 #!/bin/bash
 
 #################################################################
-# Wallhaven Wallpaper Downloader (SFW + Sketchy)
-# 
-# Description: Downloads portrait wallpapers from Wallhaven.cc
-#              including SFW and Sketchy content (NO NSFW)
+#    WALLHAVEN STANDALONE DOWNLOADER - BASH (SFW + SKETCHY)
+#################################################################
 #
-# Usage: ./dl-wall-nsfw.sh [search_query] [count] [api_key]
-#        Example: ./dl-wall-nsfw.sh "nature" 10 "your_api_key_here"
+# IMPORTANT: Despite filename "nsfw", this downloads ONLY
+# SFW + Sketchy (purity=110), NO actual NSFW content!
+#
+# Purpose:
+#   Bash version of SFW+Sketchy wallpaper downloader.
+#   Requires API key for authentication.
+#
+# Why Bash Version?
+#   • Works on systems without Python
+#   • Lightweight and fast
+#   • Easy to run on servers (no dependencies)
+#   • Great for automation scripts
+#
+# Key Differences from dl-wall-sfw.sh:
+#   ✓ Includes Sketchy content (purity=110 vs 100)
+#   ✓ Requires API key parameter
+#   ✗ No exclusion tags (relies on purity filter)
+#
+# Key Differences from Python version:
+#   ✓ Same functionality
+#   ✓ Uses curl for API, wget for downloads
+#   ✓ Grep/sed for JSON parsing (no jq!)
+#   ✗ Simpler error handling
+#
+# Content Policy: SFW + SKETCHY (NO NSFW)
+#   • Purity: 110 (SFW + Sketchy)
+#   • API key required for authentication
+#
+# Usage:
+#   Interactive mode:
+#     ./dl-wall-nsfw.sh
+#   
+#   Command-line mode:
+#     ./dl-wall-nsfw.sh "nature" 10 "your_api_key"
+#     ./dl-wall-nsfw.sh "anime" 25 "abc123def456"
 #
 # Parameters:
 #   $1 - Search query (optional, defaults to "anime")
-#   $2 - Number of wallpapers to download (optional, defaults to 5)
-#   $3 - Wallhaven API key (required for Sketchy content)
+#   $2 - Download count (optional, defaults to 5)
+#   $3 - API key (required for Sketchy access)
 #
-# Note: Get your API key from https://wallhaven.cc/settings/account
+# Get API Key:
+#   https://wallhaven.cc/settings/account
+#
+# Examples:
+#   ./dl-wall-nsfw.sh
+#   ./dl-wall-nsfw.sh "mountain" 20 "mykey123"
+#   ./dl-wall-nsfw.sh "digital art" 15 "abc123"
+#
+# Requirements:
+#   • curl  (API requests)
+#   • wget  (image downloads)
+#   • grep  (JSON parsing)
+#   • sed   (text processing)
+#
+# Output:
+#   Wallpapers in current directory:
+#     wallhaven-abc123.jpg
+#     wallhaven-xyz789.jpg
+#
 #################################################################
 
-# Get API key from command line argument or prompt user
+#################################################################
+# STEP 1: Get API Key (REQUIRED!)
+#################################################################
+# Unlike SFW version, API key is MANDATORY here!
+#
+# Why required?
+# • Sketchy content requires authentication
+# • Wallhaven API returns 401 Unauthorized without valid key
+# • No way to access purity=110 (Sketchy) anonymously
+#
+# Priority: Command-line arg > User input > Exit (no default)
+
 if [ -z "$3" ]; then
+  # No command-line argument for API key - ask user
   read -p "Enter your Wallhaven API key: " api_key
+  
+  # Check if user provided key
   if [ -z "$api_key" ]; then
+    # Empty input - cannot proceed!
     echo "Error: API key is required to access Sketchy content!"
     echo "Get your API key from: https://wallhaven.cc/settings/account"
-    exit 1
+    exit 1  # Exit with error code
   fi
 else
+  # Command-line argument provided (3rd parameter)
   api_key="$3"
 fi
 

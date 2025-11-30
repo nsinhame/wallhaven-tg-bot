@@ -1,0 +1,19 @@
+# ============================================================
+# Wallhaven API Key Configuration
+# ============================================================
+#
+# Get your API key from: https://wallhaven.cc/settings/account
+#
+# Instructions:
+# 1. Log in to Wallhaven.cc
+# 2. Go to Settings > Account
+# 3. Find "API Key" section
+# 4. Copy your key
+# 5. Paste it on a new line below (replacing the placeholder)
+#
+# NOTE: You don't need to remove these comment lines!
+# The script automatically skips lines starting with #
+#
+# ============================================================
+
+your_wallhaven_api_key_here

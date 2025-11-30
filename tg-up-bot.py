@@ -1,6 +1,48 @@
 #!/usr/bin/env python3
 
 """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                     TELEGRAM WALLPAPER UPLOAD BOT                            ║
+║                                                                              ║
+║  A sophisticated automation bot that fetches wallpapers from MongoDB and     ║
+║  uploads them to category-specific Telegram groups with intelligent         ║
+║  duplicate detection using SHA256 and perceptual hashing (pHash).           ║
+║                                                                              ║
+║  KEY FEATURES:                                                               ║
+║  • Random wallpaper selection per category                                   ║
+║  • Custom posting intervals per category (configurable in config.txt)        ║
+║  • Duplicate detection: SHA256 (exact) + pHash (similar images)              ║
+║  • Two-stage upload: Preview (photo) + HD version (document)                 ║
+║  • Database status tracking: link_added → posted/failed/skipped              ║
+║  • Graceful shutdown with active task completion                             ║
+║  • Independent scheduling per category using APScheduler                     ║
+║                                                                              ║
+║  WORKFLOW:                                                                   ║
+║  1. Load configuration (MongoDB URI, Telegram credentials, categories)       ║
+║  2. Connect to MongoDB and Telegram Bot API                                  ║
+║  3. Schedule independent jobs for each category with custom intervals        ║
+║  4. For each scheduled run per category:                                     ║
+║     a. Fetch one RANDOM pending wallpaper (status="link_added")             ║
+║     b. Download image temporarily                                            ║
+║     c. Calculate SHA256 hash (exact duplicate check)                         ║
+║     d. Calculate pHash (perceptual hash for similar image detection)         ║
+║     e. Check database for duplicates (SHA256 or pHash similarity < 5)        ║
+║     f. If duplicate: mark as "skipped", delete temp file, exit               ║
+║     g. If unique: upload to Telegram (preview + HD document)                 ║
+║     h. Update database with hashes, Telegram response, status="posted"       ║
+║     i. Clean up temporary file                                               ║
+║  5. Repeat step 4 at configured intervals until shutdown                     ║
+║                                                                              ║
+║  CONFIGURATION FILES:                                                        ║
+║  • config.txt         - Categories, group IDs, intervals (used by this bot)  ║
+║  • tg-config.txt      - Telegram API credentials                             ║
+║  • mongodb-uri.txt    - MongoDB connection string                            ║
+║                                                                              ║
+║  DEPENDENCIES:                                                               ║
+║  pip install telethon httpx Pillow imagehash pymongo APScheduler             ║
+║                                                                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+"""
 Telegram Wallpaper Upload Bot
 
 Description: Fetches wallpaper links from MongoDB and uploads them to 
@@ -32,27 +74,44 @@ Features:
     - Scheduled posting with configurable intervals per group
 """
 
-import os
-import sys
-import json
-import random
-import logging
-import asyncio
-import hashlib
-import signal
-from datetime import datetime
-from urllib.parse import urlparse
+# ============================================================================
+# IMPORTS
+# ============================================================================
 
-import httpx
-from PIL import Image
-import imagehash
-from telethon import TelegramClient
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure
+# Standard library imports
+import os              # File system operations (path checks, file deletion)
+import sys             # System operations (exit codes)
+import json            # JSON parsing for database responses
+import random          # Random number generation for filenames
+import logging         # Logging framework for status messages
+import asyncio         # Asynchronous I/O for concurrent operations
+import hashlib         # SHA256 hash calculation for exact duplicate detection
+import signal          # Signal handling for graceful shutdown (SIGINT, SIGTERM)
+from datetime import datetime        # Timestamp handling
+from urllib.parse import urlparse    # URL parsing to extract filenames
 
-# --- Configuration ---
-SIMILARITY_THRESHOLD = 5  # pHash difference threshold for duplicate detection
+# Third-party imports
+import httpx                                          # Async HTTP client for image downloads
+from PIL import Image                                 # Image processing library
+import imagehash                                      # Perceptual hash calculation
+from telethon import TelegramClient                   # Telegram Bot API client
+from apscheduler.schedulers.asyncio import AsyncIOScheduler  # Job scheduler
+from pymongo import MongoClient                       # MongoDB Python driver
+from pymongo.errors import ConnectionFailure          # MongoDB connection error handling
+
+# ============================================================================
+# CONFIGURATION CONSTANTS
+# ============================================================================
+
+# Perceptual Hash (pHash) similarity threshold for duplicate detection
+# pHash compares images based on visual similarity, not exact pixel match
+# Range: 0 (identical) to 64 (completely different)
+# Threshold of 5 means: if pHash difference < 5, images are considered similar
+# Adjust this value based on your duplicate detection sensitivity:
+#   • Lower value (1-3): Very strict, only nearly identical images
+#   • Medium value (5-10): Moderate, catches resized/compressed versions
+#   • Higher value (15+): Loose, may catch false positives
+SIMILARITY_THRESHOLD = 5
 
 # --- Logging Setup ---
 logging.basicConfig(
@@ -60,33 +119,135 @@ logging.basicConfig(
     level=logging.INFO
 )
 
-# --- Graceful Shutdown ---
+# ============================================================================
+# GRACEFUL SHUTDOWN MANAGEMENT
+# ============================================================================
+
+# Global flag to signal shutdown request (set to True when SIGINT/SIGTERM received)
 shutdown_requested = False
+
+# Set of currently active upload tasks (tracked to ensure completion before exit)
+# Each task is added when starting upload, removed when finished
+# On shutdown, bot waits for all tasks in this set to complete
 ACTIVE_TASKS = set()
 
 def handle_shutdown():
-    """Signal handler for graceful shutdown"""
+    """
+    Signal handler for graceful shutdown (Ctrl+C or kill signal).
+    
+    Flow:
+    1. Set global shutdown_requested flag to True
+    2. Prevent new tasks from starting (checked in send_wallpaper_to_group)
+    3. Allow active tasks in ACTIVE_TASKS set to complete
+    4. Main loop exits once all tasks are done
+    
+    This ensures:
+    - No partial uploads left in database with wrong status
+    - Temporary files are cleaned up properly
+    - Database connections closed cleanly
+    """
     global shutdown_requested
     shutdown_requested = True
     logging.info("Shutdown requested. Waiting for ongoing tasks to complete...")
 
-# --- Configuration Loaders ---
+# ============================================================================
+# CONFIGURATION LOADERS
+# ============================================================================
+#
+# \u2705 COMMENT HANDLING - USER-FRIENDLY FEATURE
+# ----------------------------------------------------------------------------
+# All configuration loaders automatically skip:
+# \u2022 Lines starting with # (comments)
+# \u2022 Empty/whitespace-only lines
+#
+# WHY? This allows you to keep documentation directly in config files!
+# No need to manually remove instruction comments before using.
+#
+# Example - mongodb-uri.txt can contain:
+#   # MongoDB Connection URI
+#   # Format: mongodb://host:port
+#   # Instructions: Replace with your actual URI
+#   mongodb://localhost:27017
+#
+# \u2192 Loader extracts: "mongodb://localhost:27017"
+# \u2192 Ignores all comment lines automatically
+#
+# This applies to:
+# \u2022 mongodb-uri.txt (load_mongodb_uri)
+# \u2022 wallhaven-api.txt (used by update-link-db.py)
+# \u2022 tg-config.txt (load_telegram_config) - KEY=VALUE format
+# \u2022 config.txt (load_bot_config) - Pipe-delimited format
+#
+# \u27a1\ufe0f You can safely leave comments in ALL config files!
+# ============================================================================
 
 def load_mongodb_uri():
-    """Load MongoDB URI from file"""
+    """
+    Load MongoDB URI from mongodb-uri.txt file.
+    
+    File Parsing:
+    • Reads file line by line
+    • Skips empty lines
+    • Skips comment lines (starting with #)
+    • Returns first non-comment, non-empty line
+    
+    This allows users to keep comments/instructions in the file:
+        # MongoDB Connection URI
+        # Instructions: Replace with your connection string
+        mongodb://localhost:27017
+    
+    Returns:
+        str: MongoDB connection URI
+    
+    Exits:
+        If file doesn't exist or contains no valid URI
+    """
     if not os.path.exists('mongodb-uri.txt'):
         logging.error("mongodb-uri.txt not found!")
         sys.exit(1)
     
     with open('mongodb-uri.txt', 'r') as f:
-        uri = f.read().strip()
-        if not uri:
-            logging.error("mongodb-uri.txt is empty!")
-            sys.exit(1)
-        return uri
+        for line in f:
+            line = line.strip()
+            # Skip empty lines and comments
+            if line and not line.startswith('#'):
+                return line
+        
+        # No valid URI found
+        logging.error("mongodb-uri.txt contains no valid URI (only comments/empty lines)!")
+        sys.exit(1)
 
 def load_telegram_config():
-    """Load Telegram bot configuration from file"""
+    """
+    Load Telegram bot credentials from tg-config.txt file.
+    
+    File Format:
+        API_ID=12345678
+        API_HASH=abcdef1234567890abcdef1234567890
+        BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrsTUVwxyz
+    
+    File Parsing:
+    • Reads line by line
+    • Skips empty lines
+    • Skips comment lines (starting with #)
+    • Splits by '=' to extract key-value pairs
+    • Validates all required keys are present
+    
+    Allowed in file (will be ignored):
+        # Telegram Bot Configuration
+        # Get from https://my.telegram.org/apps
+        
+        API_ID=12345678
+        # API_HASH from Telegram
+        API_HASH=abc123...
+        BOT_TOKEN=...
+    
+    Returns:
+        dict: {'API_ID': '...', 'API_HASH': '...', 'BOT_TOKEN': '...'}
+    
+    Exits:
+        If file doesn't exist or missing required keys
+    """
     if not os.path.exists('tg-config.txt'):
         logging.error("tg-config.txt not found!")
         logging.error("Please create tg-config.txt with format:")
@@ -112,10 +273,37 @@ def load_telegram_config():
     return config
 
 def load_bot_config():
-    """Load consolidated bot configuration from config.txt
+    """
+    Load consolidated bot configuration from config.txt file.
+    
+    File Format:
+        category | group_id | interval_seconds | search_terms
+        Example:
+        nature | -1002996780898 | 3050 | tree, water, river
+    
+    Parsing Logic:
+    • Split each line by '|' delimiter (expecting 4 parts minimum)
+    • Extract category name, Telegram group ID, posting interval
+    • Ignore search_terms (4th field) - only used by update-link-db.py
+    • Skip comments (lines starting with #) and empty lines
+    • Validate group_id and interval are valid integers
+    • Validate interval is positive (> 0)
     
     Returns:
         dict: {category: {group_id: int, interval: int}}
+        Example:
+        {
+            'nature': {'group_id': -1002996780898, 'interval': 3050},
+            'anime': {'group_id': -1002935599065, 'interval': 1000}
+        }
+    
+    Why search_terms are ignored:
+    • This bot fetches ANY wallpaper from MongoDB with matching category
+    • It doesn't care which search term originally found the wallpaper
+    • search_terms are only needed by update-link-db.py for API queries
+    
+    Exits:
+        If config.txt doesn't exist or contains no valid categories
     """
     if not os.path.exists('config.txt'):
         logging.error("config.txt not found!")
@@ -206,7 +394,73 @@ def calculate_hashes(filepath):
         return None, None
 
 async def check_duplicate_hashes(collection, sha256, p_hash):
-    """Check if image already exists using SHA256 and pHash"""
+    """
+    Two-tier duplicate detection: exact (SHA256) + similarity (pHash).
+    
+    TIER 1: SHA256 Exact Match
+    • SHA256 is cryptographic hash of file contents
+    • Identical files = identical SHA256 (even if renamed)
+    • Use case: Catch exact duplicates, re-uploads, or same file
+    
+    TIER 2: Perceptual Hash (pHash) Similarity
+    • pHash analyzes visual content, not bytes
+    • Similar looking images have similar pHash values
+    • Use case: Catch resized, compressed, or slightly edited versions
+    • Hamming distance measures how many bits differ between hashes
+    • Lower distance = more similar images
+    
+    Why Both Methods?
+    • SHA256 alone misses resized/compressed duplicates
+    • pHash alone might have false positives
+    • Combined approach: strict exact check + fuzzy similarity check
+    
+    Algorithm:
+    1. Quick check: SHA256 exact match in database
+       → If found: immediate duplicate, return details
+    2. Thorough check: Compare pHash with ALL posted images
+       → Calculate Hamming distance for each
+       → If distance < SIMILARITY_THRESHOLD: similar image found
+    3. If both checks pass: image is unique, proceed with upload
+    
+    Performance Optimization:
+    • SHA256 check is O(1) with database index
+    • pHash check is O(n) but only for non-exact duplicates
+    • Could optimize with vector similarity search (future enhancement)
+    
+    Args:
+        collection: MongoDB collection
+        sha256: SHA256 hex string of downloaded image
+        p_hash: Perceptual hash hex string (from imagehash library)
+    
+    Returns:
+        tuple: (status, reasons)
+        
+        status values:
+        • "duplicate" - Exact SHA256 match found
+        • "similar"   - pHash similarity below threshold
+        • "proceed"   - No duplicates found, safe to upload
+        
+        reasons: dict with duplicate details (or None if unique)
+        Example for duplicate:
+        {
+            "reason": "Duplicate",
+            "details": {
+                "type": "SHA256_match",
+                "wallpaper_id": "abc123"
+            }
+        }
+        
+        Example for similar:
+        {
+            "reason": "Similar",
+            "details": {
+                "type": "pHash_match",
+                "diff": 3,
+                "similarity_percentage": 95.31,
+                "wallpaper_id": "xyz789"
+            }
+        }
+    """
     # Check exact SHA256 match
     exact_match = collection.find_one({"sha256": sha256})
     if exact_match:
@@ -271,9 +525,53 @@ async def download_image(url, filename):
 # --- Database Operations ---
 
 def get_pending_wallpaper(collection, category):
-    """Fetch one random pending wallpaper for a specific category"""
+    """
+    Fetch one RANDOM pending wallpaper from MongoDB for the specified category.
+    
+    Why Random Selection?
+    • Previous version fetched oldest first (FIFO queue)
+    • Random selection provides better variety in posts
+    • Prevents predictable posting patterns
+    • Users requested this feature for more natural feed appearance
+    
+    Database Query Strategy:
+    1. First, count documents matching criteria (for logging purposes)
+    2. Use MongoDB aggregation pipeline with $sample stage
+    3. $sample efficiently selects random document from matched set
+    
+    Query Criteria:
+    • category: Must match the category being processed
+    • status: "link_added" = fetched by update-link-db.py but not yet posted
+    
+    Status Flow in Database:
+    link_added → posted     (successful upload)
+                → failed     (download/upload error)
+                → skipped    (duplicate detected)
+    
+    Args:
+        collection: PyMongo collection object (wallpaper-bot.wallhaven)
+        category: Category name (e.g., "nature", "anime")
+    
+    Returns:
+        dict: Wallpaper document with fields:
+              - wallpaper_id: Wallhaven ID
+              - category: Category name
+              - search_term: Original search term that found it
+              - jpg_url: Direct image URL
+              - tags: List of tag strings
+              - purity: "sfw" or "sketchy"
+              - sfw: Boolean (True=SFW, False=Sketchy)
+              - status: "link_added"
+              - created_at: Unix timestamp
+        None: If no pending wallpapers found or error occurs
+    
+    MongoDB Aggregation Pipeline Explained:
+    • $match: Filter documents (like WHERE clause in SQL)
+    • $sample: Randomly select N documents from matched set
+    • This is more efficient than fetching all and picking random in Python
+    """
     try:
-        # Get count of pending wallpapers
+        # Get count of pending wallpapers (useful for monitoring/debugging)
         count = collection.count_documents(
             {"category": category, "status": "link_added"}
         )
@@ -281,9 +579,11 @@ def get_pending_wallpaper(collection, category):
         if count == 0:
             return None
         
-        # Get random wallpaper using aggregation pipeline
+        # MongoDB aggregation pipeline for random selection
         pipeline = [
+            # Stage 1: Filter by category and status
             {"$match": {"category": category, "status": "link_added"}},
+            # Stage 2: Randomly sample 1 document from matched set
             {"$sample": {"size": 1}}
         ]
         

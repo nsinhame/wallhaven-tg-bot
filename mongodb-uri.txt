@@ -1,0 +1,28 @@
+# ============================================================
+# MongoDB Connection URI Configuration
+# ============================================================
+#
+# Format: mongodb://[username:password@]host[:port][/database][?options]
+#
+# Examples:
+#
+# Local MongoDB (no authentication):
+#   mongodb://localhost:27017
+#
+# Local MongoDB (with authentication):
+#   mongodb://myUser:myPassword@localhost:27017
+#
+# MongoDB Atlas (cloud):
+#   mongodb+srv://username:password@cluster0.xxxxx.mongodb.net/?retryWrites=true&w=majority
+#
+# Instructions:
+# 1. Choose your MongoDB setup (local or Atlas)
+# 2. Copy the appropriate connection string
+# 3. Replace the line below with your actual URI
+#
+# NOTE: You don't need to remove these comment lines!
+# The script automatically skips lines starting with #
+#
+# ============================================================
+
+mongodb://localhost:27017

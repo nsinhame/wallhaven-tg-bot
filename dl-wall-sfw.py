@@ -1,33 +1,98 @@
 #!/usr/bin/env python3
 
 """
-Wallhaven Wallpaper Downloader (SFW)
+═══════════════════════════════════════════════════════════════════════════════
+                    WALLHAVEN STANDALONE SFW DOWNLOADER
+═══════════════════════════════════════════════════════════════════════════════
 
-Description: Downloads portrait wallpapers from Wallhaven.cc
-             with SFW filters and exclusion tags applied
+Purpose:
+    Standalone script for direct wallpaper downloads from Wallhaven.cc
+    WITHOUT database integration. Perfect for quick downloads or testing.
 
-Usage: python dl-wall-sfw.py [search_query] [count]
-       Example: python dl-wall-sfw.py "nature" 10
+Key Differences from update-link-db.py:
+    ✓ No MongoDB required
+    ✓ Downloads directly to current directory
+    ✓ No metadata storage
+    ✓ Immediate results
+    ✗ No tag fetching (uses search API only)
+    ✗ No duplicate tracking across sessions
+
+Content Policy: STRICT SFW ONLY
+    • Purity: 100 (SFW only, no Sketchy content)
+    • Additional exclusion tags for safety
+    • No API key required
+
+Usage:
+    Interactive mode:
+        python dl-wall-sfw.py
+    
+    Command-line mode:
+        python dl-wall-sfw.py "nature" 10
+        python dl-wall-sfw.py "anime landscape" 25
 
 Parameters:
-    search_query - Search query (optional, defaults to "anime")
-    count - Number of wallpapers to download (optional, defaults to 5)
+    search_query (optional) - What to search for (default: "anime")
+    count (optional)        - How many to download (default: 5)
+
+Examples:
+    python dl-wall-sfw.py
+    python dl-wall-sfw.py "mountain"
+    python dl-wall-sfw.py "digital art" 15
+
+Output:
+    Wallpapers are saved in current directory with original filenames:
+        wallhaven-abc123.jpg
+        wallhaven-xyz789.jpg
+
+Dependencies:
+    pip install requests
+
+═══════════════════════════════════════════════════════════════════════════════
 """
 
-import sys
-import os
-import requests
-from pathlib import Path
-from urllib.parse import quote_plus
+# ============================================================================
+# IMPORTS
+# ============================================================================
+
+import sys              # Command-line arguments and exit codes
+import os               # File operations (check existence, file size, delete)
+import requests         # HTTP client for API requests and image downloads
+from pathlib import Path        # Modern path handling (not actively used but available)
+from urllib.parse import quote_plus  # URL encoding (not actively used but available)
+
+# ============================================================================
+# MAIN FUNCTION
+# ============================================================================
 
 def main():
-    # Get search query from command line argument or prompt user
+    """
+    Main execution function for standalone SFW wallpaper downloader.
+    
+    Workflow:
+    1. Get search query (from args or user input)
+    2. Get count (from args or user input)
+    3. Apply exclusion tags for content safety
+    4. Query Wallhaven search API
+    5. Download images page by page
+    6. Display progress and final statistics
+    
+    No database involved - pure download script!
+    """
+    
+    # ========================================================================
+    # STEP 1: Get Search Query
+    # ========================================================================
+    # Priority: Command-line arg > User input > Default ("anime")
+    
     if len(sys.argv) > 1:
+        # Command-line argument provided
         query = sys.argv[1]
     else:
+        # Interactive mode - ask user
         query = input("Search Wallhaven: ").strip()
         if not query:
-            query = "anime"  # Default to "anime" if user presses Enter
+            # User pressed Enter without typing - use default
+            query = "anime"
     
     # Get number of wallpapers to download from argument or prompt user
     if len(sys.argv) > 2:
@@ -40,13 +105,29 @@ def main():
         count_input = input("How many wallpapers to download (default 5): ").strip()
         max_count = int(count_input) if count_input else 5
     
+    # ========================================================================
+    # STEP 3: Prepare Query with Safety Filters
+    # ========================================================================
+    
     # Clean up query for URL encoding
-    # Remove # symbols and replace spaces with + for URL compatibility
+    # Remove # symbols (hashtags break URL encoding)
     query = query.replace('#', '')
     
-    # Add exclusion tags to filter out NSFW/inappropriate content
+    # ========================================================================
+    # EXCLUSION TAGS - Content Safety Layer
+    # ========================================================================
+    # Why exclusion tags?
+    # • purity=100 (SFW) alone isn't always sufficient
+    # • Some SFW wallpapers may have suggestive tags
+    # • Exclusion tags provide additional safety filtering
+    #
     # Each tag with "-" prefix means "exclude wallpapers with this tag"
-    # This comprehensive list includes both singular and plural forms for maximum safety
+    # Comprehensive list with singular + plural forms for maximum coverage
+    #
+    # Example: If a wallpaper has tags ["girl", "anime", "landscape"],
+    # it will be excluded because it contains "girl" from exclusion list.
+    # ========================================================================
+    
     exclusions = [
         "-girl", "-girls", "-woman", "-women", "-female", "-females",
         "-lady", "-ladies", "-thigh", "-thighs", "-skirt", "-skirts",
