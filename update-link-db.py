@@ -405,9 +405,9 @@ def get_wallhaven_api_key():
     3. Save user input to file for future use
     
     File Parsing:
-    • Reads file line by line
-    • Skips empty lines and comments (starting with #)
-    • Returns first valid line as API key
+        - Reads file line by line
+        - Skips empty lines and comments (starting with #)
+        - Returns first valid line as API key
     
     Example file content:
         # Wallhaven API Key
