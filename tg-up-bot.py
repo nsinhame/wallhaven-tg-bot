@@ -11,14 +11,10 @@ import signal
 from datetime import datetime
 from urllib.parse import urlparse
 import httpx
-from PIL import Image
-import imagehash
 from telethon import TelegramClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
-
-SIMILARITY_THRESHOLD = 5
 
 logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -205,14 +201,12 @@ def calculate_hashes(filepath):
             for block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(block)
         sha256 = sha256_hash.hexdigest()
-        # phash disabled for memory optimization - only using SHA256
-        return sha256, None
+        return sha256
     except Exception as e:
         logging.error(f"Error calculating hashes for {filepath}: {e}")
-        return None, None
+        return None
 
-async def check_duplicate_hashes(collection, sha256, p_hash):
-    # Only check SHA256 for exact duplicates (phash disabled for memory optimization)
+async def check_duplicate_hashes(collection, sha256):
     exact_match = collection.find_one({"sha256": sha256})
     if exact_match:
         return "duplicate", {
@@ -269,14 +263,12 @@ def get_pending_wallpapers(collection, category, count=3):
         logging.error(f"Database query failed: {e}")
         return []
 
-def update_wallpaper_status(collection, wallpaper_id, status, sha256=None, phash=None, 
+def update_wallpaper_status(collection, wallpaper_id, status, sha256=None, 
                            tg_response=None, reasons=None):
     try:
         update_data = {"status": status}
         if sha256:
             update_data["sha256"] = sha256
-        if phash:
-            update_data["phash"] = phash
         if tg_response:
             update_data["tg_response"] = tg_response
         if reasons:
@@ -338,8 +330,8 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                 continue
             
             # Calculate hashes
-            sha256, phash = calculate_hashes(path)
-            if not sha256 or not phash:
+            sha256 = calculate_hashes(path)
+            if not sha256:
                 reasons = {"reason": "Hashing failed"}
                 update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
                 os.remove(path)
@@ -347,13 +339,13 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                 continue
             
             # Check for duplicates
-            status_check, reasons = await check_duplicate_hashes(collection, sha256, phash)
+            status_check, reasons = await check_duplicate_hashes(collection, sha256)
             if status_check in ["duplicate", "similar"]:
                 log_details = f"{reasons['details']['type']}"
                 if 'similarity_percentage' in reasons['details']:
                     log_details += f" ({reasons['details']['similarity_percentage']}% similar)"
                 logging.warning(f"[{category}] Skipping {wallpaper_id}: {reasons['reason']} - {log_details}")
-                update_wallpaper_status(collection, wallpaper_id, "skipped", sha256, phash, reasons=reasons)
+                update_wallpaper_status(collection, wallpaper_id, "skipped", sha256, reasons=reasons)
                 os.remove(path)
                 continue
             
@@ -362,7 +354,6 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                 'wallpaper_id': wallpaper_id,
                 'path': path,
                 'sha256': sha256,
-                'phash': phash,
                 'tags': tags,
                 'search_term': search_term
             })
@@ -424,7 +415,6 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                     item['wallpaper_id'],
                     "posted",
                     item['sha256'],
-                    item['phash'],
                     tg_response=tg_response
                 )
                 logging.info(f"[{category}] ✓ Posted {item['wallpaper_id']} to group {group_id} (album {i+1}/{len(wallpaper_data)})")
@@ -435,7 +425,7 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             for item in wallpaper_data:
                 reasons = {"reason": "Telegram upload failed", "error": str(telegram_e)}
                 update_wallpaper_status(collection, item['wallpaper_id'], "failed", 
-                                      item['sha256'], item['phash'], reasons=reasons)
+                                      item['sha256'], reasons=reasons)
         
         finally:
             # Clean up all downloaded files

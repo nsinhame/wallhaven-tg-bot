@@ -226,7 +226,6 @@ def main():
                             "sfw": is_sfw,
                             "status": "link_added",
                             "sha256": None,
-                            "phash": None,
                             "tg_response": {},
                             "created_at": current_timestamp
                         }
