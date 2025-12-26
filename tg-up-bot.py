@@ -262,22 +262,37 @@ async def download_image(url, filename):
         logging.warning(f"Download failed for {url}: {e}")
         return None
 
-def get_pending_wallpaper(collection, category):
+def get_pending_wallpapers(collection, category, count=3):
+    """
+    Get multiple pending wallpapers for a category.
+    
+    Args:
+        collection: MongoDB collection
+        category: Category name
+        count: Number of wallpapers to fetch (default: 3)
+    
+    Returns:
+        List of wallpaper documents, or empty list if none available
+    """
     try:
-        count = collection.count_documents(
+        available = collection.count_documents(
             {"category": category, "status": "link_added"}
         )
-        if count == 0:
-            return None
+        if available == 0:
+            return []
+        
+        # Get random wallpapers, but no more than available
+        fetch_count = min(count, available)
+        
         pipeline = [
             {"$match": {"category": category, "status": "link_added"}},
-            {"$sample": {"size": 1}}
+            {"$sample": {"size": fetch_count}}
         ]
         result = list(collection.aggregate(pipeline))
-        return result[0] if result else None
+        return result
     except Exception as e:
         logging.error(f"Database query failed: {e}")
-        return None
+        return []
 
 def update_wallpaper_status(collection, wallpaper_id, status, sha256=None, phash=None, 
                            tg_response=None, reasons=None):
@@ -316,79 +331,143 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
     task = asyncio.current_task()
     ACTIVE_TASKS.add(task)
     try:
-        wallpaper = get_pending_wallpaper(collection, category)
-        if not wallpaper:
+        # Fetch 3 wallpapers at once
+        wallpapers = get_pending_wallpapers(collection, category, count=3)
+        if not wallpapers:
             logging.info(f"No pending wallpapers found for category '{category}'")
             return
-        wallpaper_id = wallpaper.get('wallpaper_id')
-        jpg_url = wallpaper.get('jpg_url')
-        tags = wallpaper.get('tags', [])
-        search_term = wallpaper.get('search_term', category)
-        filename = f"{category}_{random.randint(1000, 9999)}_{os.path.basename(urlparse(jpg_url).path)}"
-        logging.info(f"[{category}] Processing {wallpaper_id}...")
-        path = await download_image(jpg_url, filename)
-        if not path:
-            reasons = {"reason": "Download failed", "url": jpg_url}
-            update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
-            logging.error(f"[{category}] Download failed for {wallpaper_id}")
+        
+        logging.info(f"[{category}] Processing {len(wallpapers)} wallpapers as a group...")
+        
+        # Track data for each wallpaper
+        wallpaper_data = []
+        
+        # Process each wallpaper: download, hash, check duplicates
+        for wallpaper in wallpapers:
+            wallpaper_id = wallpaper.get('wallpaper_id')
+            jpg_url = wallpaper.get('jpg_url')
+            tags = wallpaper.get('tags', [])
+            search_term = wallpaper.get('search_term', category)
+            
+            filename = f"{category}_{random.randint(1000, 9999)}_{os.path.basename(urlparse(jpg_url).path)}"
+            
+            logging.info(f"[{category}] Processing {wallpaper_id}...")
+            
+            # Download image
+            path = await download_image(jpg_url, filename)
+            if not path:
+                reasons = {"reason": "Download failed", "url": jpg_url}
+                update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
+                logging.error(f"[{category}] Download failed for {wallpaper_id}")
+                continue
+            
+            # Calculate hashes
+            sha256, phash = calculate_hashes(path)
+            if not sha256 or not phash:
+                reasons = {"reason": "Hashing failed"}
+                update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
+                os.remove(path)
+                logging.error(f"[{category}] Hashing failed for {wallpaper_id}")
+                continue
+            
+            # Check for duplicates
+            status_check, reasons = await check_duplicate_hashes(collection, sha256, phash)
+            if status_check in ["duplicate", "similar"]:
+                log_details = f"{reasons['details']['type']}"
+                if 'similarity_percentage' in reasons['details']:
+                    log_details += f" ({reasons['details']['similarity_percentage']}% similar)"
+                logging.warning(f"[{category}] Skipping {wallpaper_id}: {reasons['reason']} - {log_details}")
+                update_wallpaper_status(collection, wallpaper_id, "skipped", sha256, phash, reasons=reasons)
+                os.remove(path)
+                continue
+            
+            # Add to the list of valid wallpapers
+            wallpaper_data.append({
+                'wallpaper_id': wallpaper_id,
+                'path': path,
+                'sha256': sha256,
+                'phash': phash,
+                'tags': tags,
+                'search_term': search_term
+            })
+        
+        # Check if we have any valid wallpapers to send
+        if not wallpaper_data:
+            logging.warning(f"[{category}] No valid wallpapers to send after filtering")
             return
-        sha256, phash = calculate_hashes(path)
-        if not sha256 or not phash:
-            reasons = {"reason": "Hashing failed"}
-            update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
-            os.remove(path)
-            logging.error(f"[{category}] Hashing failed for {wallpaper_id}")
-            return
-        status_check, reasons = await check_duplicate_hashes(collection, sha256, phash)
-        if status_check in ["duplicate", "similar"]:
-            log_details = f"{reasons['details']['type']}"
-            if 'similarity_percentage' in reasons['details']:
-                log_details += f" ({reasons['details']['similarity_percentage']}% similar)"
-            logging.warning(f"[{category}] Skipping {wallpaper_id}: {reasons['reason']} - {log_details}")
-            update_wallpaper_status(collection, wallpaper_id, "skipped", sha256, phash, reasons=reasons)
-            os.remove(path)
-            return
+        
+        logging.info(f"[{category}] Sending {len(wallpaper_data)} wallpapers as grouped album...")
+        
         try:
-            preview_response = await client.send_file(
+            # Send preview images as a grouped album
+            preview_paths = [item['path'] for item in wallpaper_data]
+            preview_responses = await client.send_file(
                 group_id,
-                path,
+                preview_paths,
                 force_document=False
             )
+            
+            # Ensure preview_responses is a list
+            if not isinstance(preview_responses, list):
+                preview_responses = [preview_responses]
+            
             await asyncio.sleep(3)
-            hd_response = await client.send_file(
+            
+            # Send HD versions as grouped album with caption on first image
+            hd_responses = await client.send_file(
                 group_id,
-                path,
-                caption="🖼️ HD Download",
+                preview_paths,
+                caption=f"🖼️ HD Download ({len(wallpaper_data)} wallpapers)",
                 force_document=True
             )
-            tg_response = {
-                "preview": {
-                    "message_id": preview_response.id,
-                    "date": preview_response.date.isoformat() if preview_response.date else None
-                },
-                "hd": {
-                    "message_id": hd_response.id,
-                    "date": hd_response.date.isoformat() if hd_response.date else None
-                },
-                "group_id": group_id,
-                "uploaded_at": datetime.utcnow().isoformat()
-            }
-            update_wallpaper_status(
-                collection,
-                wallpaper_id,
-                "posted",
-                sha256,
-                phash,
-                tg_response=tg_response
-            )
-            logging.info(f"[{category}] ✓ Posted {wallpaper_id} to group {group_id}")
+            
+            # Ensure hd_responses is a list
+            if not isinstance(hd_responses, list):
+                hd_responses = [hd_responses]
+            
+            # Update database for all successfully posted wallpapers
+            for i, item in enumerate(wallpaper_data):
+                preview_msg = preview_responses[i] if i < len(preview_responses) else preview_responses[0]
+                hd_msg = hd_responses[i] if i < len(hd_responses) else hd_responses[0]
+                
+                tg_response = {
+                    "preview": {
+                        "message_id": preview_msg.id,
+                        "date": preview_msg.date.isoformat() if preview_msg.date else None
+                    },
+                    "hd": {
+                        "message_id": hd_msg.id,
+                        "date": hd_msg.date.isoformat() if hd_msg.date else None
+                    },
+                    "group_id": group_id,
+                    "uploaded_at": datetime.utcnow().isoformat(),
+                    "album_size": len(wallpaper_data)
+                }
+                
+                update_wallpaper_status(
+                    collection,
+                    item['wallpaper_id'],
+                    "posted",
+                    item['sha256'],
+                    item['phash'],
+                    tg_response=tg_response
+                )
+                logging.info(f"[{category}] ✓ Posted {item['wallpaper_id']} to group {group_id} (album {i+1}/{len(wallpaper_data)})")
+            
         except Exception as telegram_e:
-            reasons = {"reason": "Telegram upload failed", "error": str(telegram_e)}
-            update_wallpaper_status(collection, wallpaper_id, "failed", sha256, phash, reasons=reasons)
-            logging.error(f"[{category}] Telegram upload failed for {wallpaper_id}: {telegram_e}")
+            logging.error(f"[{category}] Telegram upload failed: {telegram_e}")
+            # Mark all as failed
+            for item in wallpaper_data:
+                reasons = {"reason": "Telegram upload failed", "error": str(telegram_e)}
+                update_wallpaper_status(collection, item['wallpaper_id'], "failed", 
+                                      item['sha256'], item['phash'], reasons=reasons)
+        
         finally:
-            if os.path.exists(path):
-                os.remove(path)
+            # Clean up all downloaded files
+            for item in wallpaper_data:
+                if os.path.exists(item['path']):
+                    os.remove(item['path'])
+    
     finally:
         ACTIVE_TASKS.discard(task)
 
