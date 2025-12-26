@@ -413,11 +413,10 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             
             await asyncio.sleep(3)
             
-            # Send HD versions as grouped album with caption on first image
+            # Send HD versions as grouped album
             hd_responses = await client.send_file(
                 group_id,
                 preview_paths,
-                caption=f"🖼️ HD Download ({len(wallpaper_data)} wallpapers)",
                 force_document=True
             )
             
