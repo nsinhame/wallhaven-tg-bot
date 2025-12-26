@@ -205,13 +205,14 @@ def calculate_hashes(filepath):
             for block in iter(lambda: f.read(4096), b""):
                 sha256_hash.update(block)
         sha256 = sha256_hash.hexdigest()
-        p_hash = str(imagehash.average_hash(Image.open(filepath)))
-        return sha256, p_hash
+        # phash disabled for memory optimization - only using SHA256
+        return sha256, None
     except Exception as e:
         logging.error(f"Error calculating hashes for {filepath}: {e}")
         return None, None
 
 async def check_duplicate_hashes(collection, sha256, p_hash):
+    # Only check SHA256 for exact duplicates (phash disabled for memory optimization)
     exact_match = collection.find_one({"sha256": sha256})
     if exact_match:
         return "duplicate", {
@@ -221,33 +222,7 @@ async def check_duplicate_hashes(collection, sha256, p_hash):
                 "wallpaper_id": exact_match.get('wallpaper_id')
             }
         }
-    all_phashes = collection.find(
-        {"phash": {"$ne": None, "$exists": True}},
-        {"phash": 1, "wallpaper_id": 1}
-    )
-    max_diff = 64
-    new_hash = imagehash.hex_to_hash(p_hash)
-    for doc in all_phashes:
-        phash_hex = doc.get('phash')
-        if not phash_hex or not phash_hex.strip():
-            continue
-        try:
-            db_hash = imagehash.hex_to_hash(phash_hex)
-            hash_diff = new_hash - db_hash
-            if hash_diff < SIMILARITY_THRESHOLD:
-                similarity_percentage = ((max_diff - hash_diff) / max_diff) * 100
-                return "similar", {
-                    "reason": "Similar",
-                    "details": {
-                        "type": "pHash_match",
-                        "diff": hash_diff,
-                        "similarity_percentage": round(similarity_percentage, 2),
-                        "wallpaper_id": doc.get('wallpaper_id')
-                    }
-                }
-        except Exception as e:
-            logging.warning(f"Error comparing pHash: {e}")
-            continue
+    
     return "proceed", None
 
 async def download_image(url, filename):
