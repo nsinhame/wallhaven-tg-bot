@@ -1,28 +1,42 @@
-# Wallhaven Bot Configuration
-# Format: category | group_id | interval_seconds | search_terms (comma-separated)
-# Lines starting with # are comments and will be ignored
+# ============================================================
+# Unified Configuration File for Wallhaven Bot
+# ============================================================
+# This file contains all configuration needed for the bot:
+# - MongoDB connection URI
+# - Wallhaven API key
+# - Telegram bot credentials
 #
-# This file is used by both:
-# - update-link-db.py: Fetches wallpapers using category and search_terms
-# - tg-up-bot.py: Posts wallpapers to Telegram groups with custom intervals
+# Lines starting with # are comments and will be ignored
+# ============================================================
 
-# Nature category - posts every ~50 minutes
-nature | -1002996780898 | 3050 | tree, water, river, sky, mountain, forest, ocean, sunset, landscape
+# ------------------------------------------------------------
+# MongoDB Configuration
+# ------------------------------------------------------------
+# Format: mongodb://[username:password@]host[:port][/database][?options]
+#
+# Examples:
+# - Local: mongodb://localhost:27017
+# - Atlas: mongodb+srv://username:password@cluster.xxxxx.mongodb.net/
+# ------------------------------------------------------------
+[mongodb]
+uri = mongodb://localhost:27017
 
-# Anime category - posts every ~16 minutes
-anime | -1002935599065 | 1000 | anime, cartoon, digital art, computer generated image, cgi, manga
+# ------------------------------------------------------------
+# Wallhaven API Configuration
+# ------------------------------------------------------------
+# Get your API key from: https://wallhaven.cc/settings/account
+# ------------------------------------------------------------
+[wallhaven]
+api_key = your_wallhaven_api_key_here
 
-# Vehicle category - posts every 20 minutes
-vehicle | -1002123456789 | 1200 | car, bike, racing, motorcycle, truck, sports car
-
-# Technology category - posts every 15 minutes
-technology | -1002234567890 | 900 | computer, laptop, smartphone, gadget, robot, circuit, code
-
-# Space category - posts every 25 minutes
-space | -1002345678901 | 1500 | galaxy, planet, stars, nebula, cosmos, astronaut, moon
-
-# Architecture category - posts every 18 minutes
-architecture | -1002456789012 | 1080 | building, city, skyline, modern, skyscraper, bridge
-
-# Abstract category - posts every 22 minutes
-abstract | -1002567890123 | 1320 | pattern, geometric, minimalist, colorful, shapes, texture
+# ------------------------------------------------------------
+# Telegram Bot Configuration
+# ------------------------------------------------------------
+# Get these values from:
+# - API_ID and API_HASH: https://my.telegram.org/apps
+# - BOT_TOKEN: @BotFather on Telegram
+# ------------------------------------------------------------
+[telegram]
+api_id = your_api_id_here
+api_hash = your_api_hash_here
+bot_token = your_bot_token_here

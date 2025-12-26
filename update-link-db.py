@@ -42,16 +42,16 @@ def fetch_wallpaper_tags(wallpaper_id, api_key):
         return []
 
 def parse_config_file():
-    if not os.path.exists('config.txt'):
-        print("Error: config.txt file not found!")
-        print("Please create config.txt with format:")
+    if not os.path.exists('categories.txt'):
+        print("Error: categories.txt file not found!")
+        print("Please create categories.txt with format:")
         print("  category | group_id | interval_seconds | search_term1, term2")
         print("Example:")
         print("  nature | -1002996780898 | 3050 | tree, water, river, sky")
         print("  vehicle | -1002123456789 | 1200 | car, bike, racing")
         sys.exit(1)
     categories = []
-    with open('config.txt', 'r', encoding='utf-8') as f:
+    with open('categories.txt', 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith('#'):
@@ -71,43 +71,55 @@ def parse_config_file():
                 continue
             categories.append((category, search_terms))
     if not categories:
-        print("Error: No valid categories found in config.txt!")
+        print("Error: No valid categories found in categories.txt!")
         sys.exit(1)
     return categories
 
 def get_mongodb_uri():
-    if os.path.exists('mongodb-uri.txt'):
-        with open('mongodb-uri.txt', 'r') as f:
+    if os.path.exists('config.txt'):
+        with open('config.txt', 'r') as f:
+            in_mongodb_section = False
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('#'):
-                    return line
+                if line == '[mongodb]':
+                    in_mongodb_section = True
+                    continue
+                if line.startswith('[') and line.endswith(']'):
+                    in_mongodb_section = False
+                    continue
+                if in_mongodb_section and line and not line.startswith('#'):
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        if key.strip() == 'uri':
+                            return value.strip()
     uri = os.getenv('MONGODB_URI')
     if uri:
         return uri
-    uri = input("Enter MongoDB URI: ").strip()
-    if not uri:
-        print("Error: MongoDB URI is required!")
-        sys.exit(1)
-    with open('mongodb-uri.txt', 'w') as f:
-        f.write(uri)
-    return uri
+    print("Error: MongoDB URI not found in config.txt!")
+    print("Please add it in the [mongodb] section: uri = your_mongodb_uri")
+    sys.exit(1)
 
 def get_wallhaven_api_key():
-    if os.path.exists('wallhaven-api.txt'):
-        with open('wallhaven-api.txt', 'r') as f:
+    if os.path.exists('config.txt'):
+        with open('config.txt', 'r') as f:
+            in_wallhaven_section = False
             for line in f:
                 line = line.strip()
-                if line and not line.startswith('#'):
-                    return line
-    api_key = input("Enter your Wallhaven API key: ").strip()
-    if not api_key:
-        print("Error: API key is required to access Sketchy content!")
-        print("Get your API key from: https://wallhaven.cc/settings/account")
-        sys.exit(1)
-    with open('wallhaven-api.txt', 'w') as f:
-        f.write(api_key)
-    return api_key
+                if line == '[wallhaven]':
+                    in_wallhaven_section = True
+                    continue
+                if line.startswith('[') and line.endswith(']'):
+                    in_wallhaven_section = False
+                    continue
+                if in_wallhaven_section and line and not line.startswith('#'):
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        if key.strip() == 'api_key':
+                            return value.strip()
+    print("Error: Wallhaven API key not found in config.txt!")
+    print("Please add it in the [wallhaven] section: api_key = your_api_key")
+    print("Get your API key from: https://wallhaven.cc/settings/account")
+    sys.exit(1)
 
 def main():
     print("=" * 70)
@@ -117,7 +129,7 @@ def main():
     print()
     api_key = get_wallhaven_api_key()
     categories = parse_config_file()
-    print(f"✓ Loaded {len(categories)} categories from config.txt")
+    print(f"✓ Loaded {len(categories)} categories from categories.txt")
     mongodb_uri = get_mongodb_uri()
     try:
         print("Connecting to MongoDB...")

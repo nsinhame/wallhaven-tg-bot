@@ -37,47 +37,48 @@ def handle_shutdown():
 # CONFIGURATION LOADERS
 # ============================================================================
 #
-# \u2705 COMMENT HANDLING - USER-FRIENDLY FEATURE
+# ✅ COMMENT HANDLING - USER-FRIENDLY FEATURE
 # ----------------------------------------------------------------------------
 # All configuration loaders automatically skip:
-# \u2022 Lines starting with # (comments)
-# \u2022 Empty/whitespace-only lines
+# • Lines starting with # (comments)
+# • Empty/whitespace-only lines
 #
 # WHY? This allows you to keep documentation directly in config files!
 # No need to manually remove instruction comments before using.
 #
-# Example - mongodb-uri.txt can contain:
+# Example - config.txt can contain:
+#   [mongodb]
 #   # MongoDB Connection URI
 #   # Format: mongodb://host:port
-#   # Instructions: Replace with your actual URI
-#   mongodb://localhost:27017
+#   uri = mongodb://localhost:27017
 #
-# \u2192 Loader extracts: "mongodb://localhost:27017"
-# \u2192 Ignores all comment lines automatically
+# → Loader extracts: "mongodb://localhost:27017"
+# → Ignores all comment lines automatically
 #
 # This applies to:
-# \u2022 mongodb-uri.txt (load_mongodb_uri)
-# \u2022 wallhaven-api.txt (used by update-link-db.py)
-# \u2022 tg-config.txt (load_telegram_config) - KEY=VALUE format
-# \u2022 config.txt (load_bot_config) - Pipe-delimited format
+# • config.txt [mongodb] section (load_mongodb_uri)
+# • config.txt [wallhaven] section (used by update-link-db.py)
+# • config.txt [telegram] section (load_telegram_config)
+# • categories.txt (load_bot_config) - Pipe-delimited format
 #
-# \u27a1\ufe0f You can safely leave comments in ALL config files!
+# ➡️ You can safely leave comments in ALL config files!
 # ============================================================================
 
 def load_mongodb_uri():
     """
-    Load MongoDB URI from mongodb-uri.txt file.
+    Load MongoDB URI from config.txt file.
     
     File Parsing:
     • Reads file line by line
     • Skips empty lines
     • Skips comment lines (starting with #)
-    • Returns first non-comment, non-empty line
+    • Looks for [mongodb] section
+    • Returns value of 'uri' key in that section
     
     This allows users to keep comments/instructions in the file:
+        [mongodb]
         # MongoDB Connection URI
-        # Instructions: Replace with your connection string
-        mongodb://localhost:27017
+        uri = mongodb://localhost:27017
     
     Returns:
         str: MongoDB connection URI
@@ -85,54 +86,76 @@ def load_mongodb_uri():
     Exits:
         If file doesn't exist or contains no valid URI
     """
-    if not os.path.exists('mongodb-uri.txt'):
-        logging.error("mongodb-uri.txt not found!")
+    if not os.path.exists('config.txt'):
+        logging.error("config.txt not found!")
         sys.exit(1)
     
-    with open('mongodb-uri.txt', 'r') as f:
+    with open('config.txt', 'r') as f:
+        in_mongodb_section = False
         for line in f:
             line = line.strip()
+            # Check for section headers
+            if line == '[mongodb]':
+                in_mongodb_section = True
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                in_mongodb_section = False
+                continue
             # Skip empty lines and comments
-            if line and not line.startswith('#'):
-                return line
+            if in_mongodb_section and line and not line.startswith('#'):
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    if key.strip() == 'uri':
+                        return value.strip()
         
         # No valid URI found
-        logging.error("mongodb-uri.txt contains no valid URI (only comments/empty lines)!")
+        logging.error("config.txt contains no valid MongoDB URI in [mongodb] section!")
         sys.exit(1)
 
 def load_telegram_config():
-    if not os.path.exists('tg-config.txt'):
-        logging.error("tg-config.txt not found!")
-        logging.error("Please create tg-config.txt with format:")
-        logging.error("  API_ID=your_api_id")
-        logging.error("  API_HASH=your_api_hash")
-        logging.error("  BOT_TOKEN=your_bot_token")
+    if not os.path.exists('config.txt'):
+        logging.error("config.txt not found!")
+        logging.error("Please create config.txt with [telegram] section:")
+        logging.error("  api_id = your_api_id")
+        logging.error("  api_hash = your_api_hash")
+        logging.error("  bot_token = your_bot_token")
         sys.exit(1)
     config = {}
-    with open('tg-config.txt', 'r') as f:
+    in_telegram_section = False
+    with open('config.txt', 'r') as f:
         for line in f:
             line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
+            # Check for section headers
+            if line == '[telegram]':
+                in_telegram_section = True
+                continue
+            if line.startswith('[') and line.endswith(']'):
+                in_telegram_section = False
+                continue
+            if in_telegram_section and line and not line.startswith('#') and '=' in line:
                 key, value = line.split('=', 1)
-                config[key.strip()] = value.strip()
+                key = key.strip().upper()
+                value = value.strip()
+                if key in ['API_ID', 'API_HASH', 'BOT_TOKEN']:
+                    config[key] = value
     required_keys = ['API_ID', 'API_HASH', 'BOT_TOKEN']
     for key in required_keys:
         if key not in config:
-            logging.error(f"Missing {key} in tg-config.txt")
+            logging.error(f"Missing {key} in [telegram] section of config.txt")
             sys.exit(1)
     return config
 
 def load_bot_config():
-    if not os.path.exists('config.txt'):
-        logging.error("config.txt not found!")
-        logging.error("Please create config.txt with format:")
+    if not os.path.exists('categories.txt'):
+        logging.error("categories.txt not found!")
+        logging.error("Please create categories.txt with format:")
         logging.error("  category | group_id | interval_seconds | search_term1, term2")
         logging.error("Example:")
         logging.error("  nature | -1002996780898 | 3050 | tree, water, river")
         logging.error("  anime | -1002935599065 | 1000 | anime, cartoon")
         sys.exit(1)
     config = {}
-    with open('config.txt', 'r', encoding='utf-8') as f:
+    with open('categories.txt', 'r', encoding='utf-8') as f:
         for line_num, line in enumerate(f, 1):
             line = line.strip()
             if not line or line.startswith('#'):
@@ -159,7 +182,7 @@ def load_bot_config():
                     'interval': interval
                 }
     if not config:
-        logging.error("No valid category configurations found in config.txt!")
+        logging.error("No valid category configurations found in categories.txt!")
         sys.exit(1)
     return config
 
