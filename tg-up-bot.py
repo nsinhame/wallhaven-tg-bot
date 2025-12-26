@@ -349,7 +349,8 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             tags = wallpaper.get('tags', [])
             search_term = wallpaper.get('search_term', category)
             
-            filename = f"{category}_{random.randint(1000, 9999)}_{os.path.basename(urlparse(jpg_url).path)}"
+            # Download to wall-cache subdirectory (will overwrite if file exists)
+            filename = os.path.join("wall-cache", f"{category}_{os.path.basename(urlparse(jpg_url).path)}")
             
             logging.info(f"[{category}] Processing {wallpaper_id}...")
             
@@ -474,6 +475,15 @@ async def main():
     logging.info("=" * 70)
     logging.info("Telegram Wallpaper Upload Bot Starting...")
     logging.info("=" * 70)
+    
+    # Create wall-cache directory if it doesn't exist
+    cache_dir = "wall-cache"
+    if not os.path.exists(cache_dir):
+        os.makedirs(cache_dir)
+        logging.info(f"✓ Created cache directory: {cache_dir}")
+    else:
+        logging.info(f"✓ Using existing cache directory: {cache_dir}")
+    
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGINT, handle_shutdown)
     loop.add_signal_handler(signal.SIGTERM, handle_shutdown)
