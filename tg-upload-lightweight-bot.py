@@ -335,12 +335,16 @@ def telegram_send_media_group(chat_id, media_list, is_document=False):
     """Send media group (album) using Telegram Bot API"""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMediaGroup"
     
+    files_dict = {}
     try:
         # Prepare media array
         media = []
-        files_dict = {}
         
         for idx, item in enumerate(media_list):
+            if not os.path.exists(item['path']):
+                logging.error(f"File not found: {item['path']}")
+                continue
+                
             file_key = f"file{idx}"
             files_dict[file_key] = open(item['path'], 'rb')
             
@@ -349,13 +353,17 @@ def telegram_send_media_group(chat_id, media_list, is_document=False):
                 "media": f"attach://{file_key}"
             }
             
-            # Add thumbnail for documents if available
-            if is_document and item.get('thumbnail'):
+            # Only add thumbnail for documents, not for photos
+            if is_document and item.get('thumbnail') and os.path.exists(item['thumbnail']):
                 thumb_key = f"thumb{idx}"
                 files_dict[thumb_key] = open(item['thumbnail'], 'rb')
                 media_item["thumbnail"] = f"attach://{thumb_key}"
             
             media.append(media_item)
+        
+        if not media:
+            logging.error("No valid media items to send")
+            return None
         
         data = {
             'chat_id': chat_id,
@@ -367,6 +375,14 @@ def telegram_send_media_group(chat_id, media_list, is_document=False):
         # Close all file handles
         for f in files_dict.values():
             f.close()
+        
+        # Log the response for debugging
+        if response.status_code != 200:
+            try:
+                error_data = response.json()
+                logging.error(f"Telegram API error: {error_data}")
+            except:
+                logging.error(f"Telegram API error: {response.text}")
         
         response.raise_for_status()
         return response.json()
