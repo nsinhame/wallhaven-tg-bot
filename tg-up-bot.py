@@ -12,6 +12,7 @@ import signal
 from datetime import datetime
 from urllib.parse import urlparse
 import httpx
+from PIL import Image
 from telethon import TelegramClient
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pymongo import MongoClient
@@ -232,6 +233,52 @@ async def download_image(url, filename):
         logging.warning(f"Download failed for {url}: {e}")
         return None
 
+def generate_thumbnail(image_path, max_size_kb=200):
+    """
+    Generate a thumbnail for large images (>9.5MB).
+    
+    Args:
+        image_path: Path to the original image
+        max_size_kb: Maximum thumbnail size in KB (default: 200)
+    
+    Returns:
+        Path to thumbnail file or None if generation fails
+    """
+    try:
+        thumb_path = image_path.replace(os.path.splitext(image_path)[1], '_thumb.jpg')
+        
+        with Image.open(image_path) as img:
+            # Convert to RGB if necessary (for PNG with transparency)
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Start with a reasonable thumbnail size
+            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            
+            # Try different quality levels to get under max_size_kb
+            for quality in [85, 75, 65, 55, 45, 35, 25]:
+                img.save(thumb_path, 'JPEG', quality=quality, optimize=True)
+                size_kb = os.path.getsize(thumb_path) / 1024
+                if size_kb <= max_size_kb:
+                    logging.info(f"Generated thumbnail: {size_kb:.1f}KB (quality={quality})")
+                    return thumb_path
+            
+            # If still too large, reduce dimensions further
+            img.thumbnail((160, 160), Image.Resampling.LANCZOS)
+            img.save(thumb_path, 'JPEG', quality=35, optimize=True)
+            logging.info(f"Generated thumbnail: {os.path.getsize(thumb_path)/1024:.1f}KB (160x160)")
+            return thumb_path
+            
+    except Exception as e:
+        logging.error(f"Failed to generate thumbnail for {image_path}: {e}")
+        return None
+
 def get_pending_wallpapers(collection, category, count=3):
     """
     Get multiple pending wallpapers for a category.
@@ -338,6 +385,15 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                 logging.error(f"[{category}] Download failed for {wallpaper_id}")
                 continue
             
+            # Check file size and generate thumbnail if needed (>9.5MB)
+            file_size_mb = os.path.getsize(path) / (1024 * 1024)
+            thumbnail_path = None
+            if file_size_mb > 9.5:
+                logging.info(f"[{category}] File size {file_size_mb:.2f}MB > 9.5MB, generating thumbnail...")
+                thumbnail_path = generate_thumbnail(path)
+                if not thumbnail_path:
+                    logging.warning(f"[{category}] Failed to generate thumbnail for {wallpaper_id}, proceeding without it")
+            
             # Calculate hashes
             sha256 = calculate_hashes(path)
             if not sha256:
@@ -362,6 +418,7 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             wallpaper_data.append({
                 'wallpaper_id': wallpaper_id,
                 'path': path,
+                'thumbnail': thumbnail_path,
                 'sha256': sha256,
                 'tags': tags,
                 'search_term': search_term
@@ -389,16 +446,33 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             
             await asyncio.sleep(3)
             
-            # Send HD versions as grouped album
-            hd_responses = await client.send_file(
-                group_id,
-                preview_paths,
-                force_document=True
-            )
+            # Send HD versions with thumbnails for large files
+            # Check if any file needs thumbnail
+            has_large_files = any(item['thumbnail'] is not None for item in wallpaper_data)
             
-            # Ensure hd_responses is a list
-            if not isinstance(hd_responses, list):
-                hd_responses = [hd_responses]
+            if has_large_files:
+                # Send files individually with thumbnails
+                hd_responses = []
+                for item in wallpaper_data:
+                    thumb = item['thumbnail'] if item['thumbnail'] else None
+                    response = await client.send_file(
+                        group_id,
+                        item['path'],
+                        force_document=True,
+                        thumb=thumb
+                    )
+                    hd_responses.append(response)
+                    await asyncio.sleep(0.5)  # Small delay between sends
+            else:
+                # Send as grouped album if no thumbnails needed
+                hd_responses = await client.send_file(
+                    group_id,
+                    preview_paths,
+                    force_document=True
+                )
+                # Ensure hd_responses is a list
+                if not isinstance(hd_responses, list):
+                    hd_responses = [hd_responses]
             
             # Update database for all successfully posted wallpapers
             for i, item in enumerate(wallpaper_data):
@@ -437,10 +511,12 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
                                       item['sha256'], reasons=reasons)
         
         finally:
-            # Clean up all downloaded files
+            # Clean up all downloaded files and thumbnails
             for item in wallpaper_data:
                 if os.path.exists(item['path']):
                     os.remove(item['path'])
+                if item['thumbnail'] and os.path.exists(item['thumbnail']):
+                    os.remove(item['thumbnail'])
     
     finally:
         ACTIVE_TASKS.discard(task)
