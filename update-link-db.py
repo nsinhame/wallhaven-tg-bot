@@ -154,7 +154,29 @@ def main():
         print()
         for term_index, search_term in enumerate(search_terms, 1):
             print(f"\n--- Processing: {category} -> {search_term} [{term_index}/{len(search_terms)}] ---\n")
+            
+            # Clean up query for URL encoding
+            # Remove # symbols and replace spaces with + for URL compatibility
             search_query = search_term.replace('#', '')
+            
+            # Add exclusion tags to filter out NSFW/inappropriate content
+            # Each tag with "-" prefix means "exclude wallpapers with this tag"
+            # This comprehensive list includes both singular and plural forms for maximum safety
+            exclusions = [
+                "-girl", "-girls", "-woman", "-women", "-female", "-females",
+                "-lady", "-ladies", "-thigh", "-thighs", "-skirt", "-skirts",
+                "-bikini", "-bikinis", "-leg", "-legs", "-cleavage", "-cleavages",
+                "-chest", "-chests", "-breast", "-breasts", "-butt", "-butts",
+                "-boob", "-boobs", "-sexy", "-hot", "-babe", "-babes",
+                "-model", "-models", "-lingerie", "-underwear", "-panty", "-panties",
+                "-bra", "-bras", "-swimsuit", "-swimsuits", "-dress", "-dresses",
+                "-schoolgirl", "-schoolgirls", "-maid", "-maids", "-waifu", "-waifus",
+                "-ecchi", "-nude", "-nudes", "-naked", "-nsfw", "-lewd",
+                "-hentai", "-ass", "-asses", "-booty", "-booties",
+                "-sideboob", "-sideboobs", "-underboob", "-underboobs"
+            ]
+            search_query = search_query + " " + " ".join(exclusions)
+            
             count = 0
             duplicates = 0
             errors = 0
