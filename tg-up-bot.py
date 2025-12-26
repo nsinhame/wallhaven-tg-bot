@@ -4,6 +4,7 @@ import os
 import sys
 import json
 import random
+import string
 import logging
 import asyncio
 import hashlib
@@ -316,8 +317,16 @@ async def send_wallpaper_to_group(client, collection, category, group_id):
             tags = wallpaper.get('tags', [])
             search_term = wallpaper.get('search_term', category)
             
-            # Download to wall-cache subdirectory (will overwrite if file exists)
-            filename = os.path.join("wall-cache", f"{category}_{os.path.basename(urlparse(jpg_url).path)}")
+            # Generate random filename: 2 letters + 2 digits + 3 letters + extension
+            # Example: ab12cde.jpg
+            ext = os.path.splitext(urlparse(jpg_url).path)[1]  # Get extension from URL
+            random_name = (
+                ''.join(random.choices(string.ascii_lowercase, k=2)) +
+                ''.join(random.choices(string.digits, k=2)) +
+                ''.join(random.choices(string.ascii_lowercase, k=3)) +
+                ext
+            )
+            filename = os.path.join("wall-cache", random_name)
             
             logging.info(f"[{category}] Processing {wallpaper_id}...")
             
