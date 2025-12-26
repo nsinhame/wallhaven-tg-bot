@@ -10,10 +10,10 @@ import asyncio
 import hashlib
 import signal
 import gc
+import subprocess
 from datetime import datetime
 from urllib.parse import urlparse
 import requests
-from PIL import Image
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from pymongo import MongoClient
 from pymongo.errors import ConnectionFailure
@@ -173,38 +173,79 @@ def download_image(url, filename):
         return None
 
 def generate_thumbnail(image_path, max_size_kb=200):
+    """
+    Generate thumbnail using ImageMagick (convert command).
+    This uses zero Python memory - all processing is done by external process.
+    
+    Args:
+        image_path: Path to the original image
+        max_size_kb: Maximum thumbnail size in KB (default: 200)
+    
+    Returns:
+        Path to thumbnail file or None if generation fails
+    """
     try:
         thumb_path = image_path.replace(os.path.splitext(image_path)[1], '_thumb.jpg')
         
-        with Image.open(image_path) as img:
-            if img.mode in ('RGBA', 'LA', 'P'):
-                background = Image.new('RGB', img.size, (255, 255, 255))
-                if img.mode == 'P':
-                    img = img.convert('RGBA')
-                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-                img = background
-            elif img.mode != 'RGB':
-                img = img.convert('RGB')
+        # ImageMagick command to create thumbnail:
+        # - Resize to fit within 320x320 while maintaining aspect ratio
+        # - Flatten alpha channel to white background
+        # - Convert to JPEG with quality 50 (lower quality for smaller size)
+        # - Strip metadata to reduce size
+        cmd = [
+            'convert',
+            image_path,
+            '-thumbnail', '320x320>',
+            '-background', 'white',
+            '-alpha', 'remove',
+            '-alpha', 'off',
+            '-quality', '50',
+            '-strip',
+            thumb_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            logging.error(f"ImageMagick failed: {result.stderr}")
+            return None
+        
+        # Check size and reduce quality if needed
+        if os.path.exists(thumb_path):
+            size_kb = os.path.getsize(thumb_path) / 1024
             
-            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
-            
-            for quality in [85, 75, 65, 55, 45, 35, 25]:
-                img.save(thumb_path, 'JPEG', quality=quality, optimize=True)
+            # If still too large, reduce quality and size further
+            if size_kb > max_size_kb:
+                cmd = [
+                    'convert',
+                    image_path,
+                    '-thumbnail', '160x160>',
+                    '-background', 'white',
+                    '-alpha', 'remove',
+                    '-alpha', 'off',
+                    '-quality', '20',
+                    '-strip',
+                    thumb_path
+                ]
+                subprocess.run(cmd, capture_output=True, timeout=30)
                 size_kb = os.path.getsize(thumb_path) / 1024
-                if size_kb <= max_size_kb:
-                    logging.info(f"Generated thumbnail: {size_kb:.1f}KB (quality={quality})")
-                    return thumb_path
             
-            img.thumbnail((160, 160), Image.Resampling.LANCZOS)
-            img.save(thumb_path, 'JPEG', quality=35, optimize=True)
-            logging.info(f"Generated thumbnail: {os.path.getsize(thumb_path)/1024:.1f}KB (160x160)")
+            logging.info(f"Generated thumbnail: {size_kb:.1f}KB")
             return thumb_path
+        
+        return None
             
+    except subprocess.TimeoutExpired:
+        logging.error(f"ImageMagick timeout for {image_path}")
+        return None
+    except FileNotFoundError:
+        logging.error("ImageMagick not found! Install with: sudo apt install imagemagick")
+        return None
     except Exception as e:
         logging.error(f"Failed to generate thumbnail for {image_path}: {e}")
         return None
     finally:
-        # Force garbage collection after image processing
+        # Force garbage collection
         gc.collect()
 
 def get_pending_wallpapers(collection, category, count=3):

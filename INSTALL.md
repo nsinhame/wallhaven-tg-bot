@@ -11,7 +11,10 @@ sudo apt update
 # Install Python 3 and pip
 sudo apt install python3 python3-pip python3-venv -y
 
-# Install system dependencies for Pillow (image processing)
+# Install ImageMagick for thumbnail generation (lightweight bot)
+sudo apt install imagemagick -y
+
+# Install system dependencies for Pillow (only needed for original bot)
 sudo apt install libjpeg-dev zlib1g-dev -y
 ```
 
@@ -78,22 +81,23 @@ sudo pip3 install -r requirements.txt
 
 ## Dependencies Explained
 
-| Package | Purpose | Used By |
-|---------|---------|---------|
+| Package/Tool | Purpose | Used By |
+|--------------|---------|---------|
 | **pymongo** | MongoDB database driver | Both scripts |
-| **requests** | HTTP requests to Wallhaven API | update-link-db.py |
-| **httpx** | Async HTTP client for downloads | tg-up-bot.py |
-| **Pillow** | Image processing (open/hash images) | tg-up-bot.py |
-| **imagehash** | Perceptual hash for duplicate detection | tg-up-bot.py |
-| **telethon** | Telegram client library | tg-up-bot.py |
-| **apscheduler** | Schedule periodic tasks | tg-up-bot.py |
+| **requests** | HTTP requests to Wallhaven API | update-link-db.py + lightweight bot |
+| **httpx** | Async HTTP client for downloads | tg-up-bot.py (original) |
+| **Pillow** | Image processing (open/hash images) | tg-up-bot.py (original) |
+| **imagehash** | Perceptual hash for duplicate detection | tg-up-bot.py (original) |
+| **telethon** | Telegram client library | tg-up-bot.py (original) |
+| **apscheduler** | Schedule periodic tasks | Both bots |
+| **ImageMagick** | Thumbnail generation (system tool) | tg-upload-lightweight-bot.py |
 
 ## Quick Start (Copy-Paste Ready)
 
 ```bash
 # 1. Install system dependencies
 sudo apt update
-sudo apt install python3 python3-pip python3-venv libjpeg-dev zlib1g-dev -y
+sudo apt install python3 python3-pip python3-venv imagemagick libjpeg-dev zlib1g-dev -y
 
 # 2. Go to your project
 cd /path/to/wallhaven-android
