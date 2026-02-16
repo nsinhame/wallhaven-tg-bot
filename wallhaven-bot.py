@@ -46,12 +46,41 @@ MAX_REQUESTS_PER_MINUTE = 40
 api_call_times = []
 rate_limit_lock = None  # Will be initialized in main()
 
+# =============================================================================
+# DUAL-CACHE ARCHITECTURE FOR FIREBASE OPTIMIZATION
+# =============================================================================
+# This bot uses TWO separate SQLite cache databases to minimize Firebase costs:
+#
+# 1. HASH CACHE (wallhaven_cache.db) - For image duplicate detection
+#    - Stores: SHA256 hashes of downloaded images
+#    - Used during: POSTING phase (after image download)
+#    - Purpose: Detect duplicate images (same content, different IDs)
+#    - Capacity: 1 million entries (~120MB disk)
+#
+# 2. METADATA CACHE (wallhaven_metadata_cache.db) - For wallpaper ID tracking
+#    - Stores: wallpaper_id, category, search_term
+#    - Used during: FETCHING phase (before image download)
+#    - Purpose: Avoid Firebase reads when checking if wallpaper exists
+#    - Capacity: 500k entries (~50MB disk)
+#    - Recovery: Syncs from Firebase on startup if cache is empty
+#
+# Cost Savings:
+# - Without metadata cache: ~100-200 Firebase reads per fetch cycle
+# - With metadata cache: ~1-5 Firebase reads per fetch cycle (99% reduction!)
+# =============================================================================
+
 # SQLite-based disk cache for duplicate hash checks (minimal RAM usage)
 CACHE_DB_FILE = "wallhaven_cache.db"  # SQLite database file
 CACHE_MAX_ENTRIES = 1000000  # 1 million entries (~120MB disk, excellent coverage)
 CACHE_CLEANUP_THRESHOLD = 0.9  # Cleanup when 90% full (900k entries)
 cache_db_conn = None  # Database connection
 cache_db_lock = None  # Thread lock for database access
+
+# Metadata cache for wallpaper IDs (avoid Firebase reads during fetching)
+METADATA_CACHE_DB_FILE = "wallhaven_metadata_cache.db"  # Metadata cache database
+METADATA_CACHE_MAX_ENTRIES = 500000  # 500k entries (lighter, faster lookups)
+metadata_cache_conn = None  # Metadata database connection
+metadata_cache_lock = None  # Thread lock for metadata database access
 
 # Rate limiting for database writes (prevent Firebase quota exhaustion)
 MAX_WALLPAPERS_PER_PERIOD = 2000  # Maximum new wallpapers to add per period
@@ -287,7 +316,8 @@ async def cleanup_cache_task():
     try:
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, cleanup_old_cache_entries)
-        logging.info("✓ Cache cleanup completed")
+        await loop.run_in_executor(None, cleanup_metadata_cache)
+        logging.info("✓ Cache cleanup completed (hash + metadata)")
     except Exception as e:
         logging.error(f"Cache cleanup failed: {e}")
 
@@ -299,19 +329,25 @@ async def maintenance_task():
         # Check integrity
         await verify_cache_integrity()
         
-        # Optimize database
+        # Optimize databases
         loop = asyncio.get_event_loop()
         
-        def optimize_db():
+        def optimize_hash_db():
             with cache_db_lock:
                 cursor = cache_db_conn.cursor()
-                # Analyze for query optimization
                 cursor.execute('ANALYZE')
-                # Reclaim unused space
                 cursor.execute('PRAGMA incremental_vacuum')
                 cache_db_conn.commit()
         
-        await loop.run_in_executor(None, optimize_db)
+        def optimize_metadata_db():
+            with metadata_cache_lock:
+                cursor = metadata_cache_conn.cursor()
+                cursor.execute('ANALYZE')
+                cursor.execute('PRAGMA incremental_vacuum')
+                metadata_cache_conn.commit()
+        
+        await loop.run_in_executor(None, optimize_hash_db)
+        await loop.run_in_executor(None, optimize_metadata_db)
         
         logging.info("✓ Weekly maintenance completed")
     except Exception as e:
@@ -335,6 +371,219 @@ def close_cache_db():
             logging.info("✓ Cache database closed and optimized")
     except Exception as e:
         logging.error(f"Error closing cache database: {e}")
+
+def init_metadata_cache_db():
+    """Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)"""
+    global metadata_cache_conn, metadata_cache_lock
+    
+    try:
+        metadata_cache_lock = threading.Lock()
+        metadata_cache_conn = sqlite3.connect(METADATA_CACHE_DB_FILE, check_same_thread=False)
+        cursor = metadata_cache_conn.cursor()
+        
+        # Create table for wallpaper metadata
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS wallpaper_metadata (
+                wallpaper_id TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                search_term TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_accessed INTEGER NOT NULL
+            )
+        ''')        
+        # Create index for category lookups (useful for syncing)
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_category 
+            ON wallpaper_metadata(category)
+        ''')        
+        # Create index on last_accessed for cleanup
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_meta_last_accessed 
+            ON wallpaper_metadata(last_accessed)
+        ''')        
+        # Optimize SQLite for stability
+        cursor.execute('PRAGMA journal_mode=DELETE')
+        cursor.execute('PRAGMA synchronous=FULL')
+        cursor.execute('PRAGMA cache_size=-2000')  # 2MB cache
+        cursor.execute('PRAGMA temp_store=MEMORY')
+        cursor.execute('PRAGMA page_size=4096')
+        cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        cursor.execute('PRAGMA incremental_vacuum(100)')
+        
+        metadata_cache_conn.commit()
+        
+        # Get cache statistics
+        cursor.execute('SELECT COUNT(*) FROM wallpaper_metadata')
+        count = cursor.fetchone()[0]
+        
+        db_size_mb = os.path.getsize(METADATA_CACHE_DB_FILE) / (1024 * 1024) if os.path.exists(METADATA_CACHE_DB_FILE) else 0
+        
+        logging.info(f"✓ Metadata cache initialized: {count:,} wallpaper IDs, {db_size_mb:.1f}MB on disk")
+        logging.info(f"  Mode: Fast lookups (max {METADATA_CACHE_MAX_ENTRIES:,} entries)")
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize metadata cache: {e}")
+        raise
+
+def check_metadata_cache(wallpaper_id):
+    """Check if wallpaper_id exists in metadata cache"""
+    global metadata_cache_conn, metadata_cache_lock
+    
+    try:
+        with metadata_cache_lock:
+            cursor = metadata_cache_conn.cursor()
+            cursor.execute(
+                'SELECT wallpaper_id FROM wallpaper_metadata WHERE wallpaper_id = ?',
+                (wallpaper_id,)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                # Update last_accessed timestamp
+                cursor.execute(
+                    'UPDATE wallpaper_metadata SET last_accessed = ? WHERE wallpaper_id = ?',
+                    (int(time.time()), wallpaper_id)
+                )
+                metadata_cache_conn.commit()
+                return True
+            
+            return False
+    except Exception as e:
+        logging.error(f"Error checking metadata cache: {e}")
+        return False  # On error, return False to check Firebase as fallback
+
+def add_to_metadata_cache(wallpaper_id, category, search_term):
+    """Add wallpaper metadata to cache"""
+    global metadata_cache_conn, metadata_cache_lock
+    
+    try:
+        with metadata_cache_lock:
+            cursor = metadata_cache_conn.cursor()
+            current_time = int(time.time())
+            cursor.execute(
+                '''INSERT OR REPLACE INTO wallpaper_metadata 
+                   (wallpaper_id, category, search_term, created_at, last_accessed) 
+                   VALUES (?, ?, ?, ?, ?)''',
+                (wallpaper_id, category, search_term, current_time, current_time)
+            )
+            metadata_cache_conn.commit()
+    except Exception as e:
+        logging.error(f"Error adding to metadata cache: {e}")
+
+def cleanup_metadata_cache():
+    """Clean up old metadata cache entries when threshold is reached"""
+    global metadata_cache_conn, metadata_cache_lock
+    
+    try:
+        with metadata_cache_lock:
+            cursor = metadata_cache_conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM wallpaper_metadata')
+            count = cursor.fetchone()[0]
+            
+            # Start cleanup when 90% full
+            cleanup_threshold = int(METADATA_CACHE_MAX_ENTRIES * 0.9)
+            
+            if count > cleanup_threshold:
+                # Keep only 70% of max entries (remove oldest 30%)
+                target_size = int(METADATA_CACHE_MAX_ENTRIES * 0.7)
+                entries_to_delete = count - target_size
+                
+                cursor.execute('''
+                    DELETE FROM wallpaper_metadata 
+                    WHERE wallpaper_id IN (
+                        SELECT wallpaper_id FROM wallpaper_metadata 
+                        ORDER BY last_accessed ASC 
+                        LIMIT ?
+                    )
+                ''', (entries_to_delete,))
+                
+                metadata_cache_conn.commit()
+                cursor.execute('PRAGMA incremental_vacuum')
+                
+                logging.info(f"Cleaned up {entries_to_delete:,} old metadata cache entries")
+                
+    except Exception as e:
+        logging.error(f"Error cleaning up metadata cache: {e}")
+
+async def sync_metadata_cache_from_firebase(wallpaper_collection):
+    """Sync metadata cache from Firebase (run on startup or after crash)"""
+    global metadata_cache_conn, metadata_cache_lock
+    
+    try:
+        logging.info("Syncing metadata cache from Firebase...")
+        
+        # Check if cache is empty (fresh deployment or corrupted)
+        with metadata_cache_lock:
+            cursor = metadata_cache_conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM wallpaper_metadata')
+            cache_count = cursor.fetchone()[0]
+        
+        if cache_count > 0:
+            logging.info(f"  Metadata cache has {cache_count:,} entries, skipping full sync")
+            return
+        
+        # Cache is empty - rebuild from Firebase
+        logging.info("  Cache is empty, rebuilding from Firebase...")
+        
+        loop = asyncio.get_event_loop()
+        
+        # Fetch all wallpaper IDs from Firebase (only the fields we need)
+        def fetch_all_metadata():
+            docs = wallpaper_collection.select(['wallpaper_id', 'category', 'search_term', 'created_at']).stream()
+            metadata_list = []
+            for doc in docs:
+                data = doc.to_dict()
+                metadata_list.append((
+                    data.get('wallpaper_id', doc.id),
+                    data.get('category', ''),
+                    data.get('search_term', ''),
+                    data.get('created_at', int(time.time())),
+                    int(time.time())  # last_accessed
+                ))
+            return metadata_list
+        
+        metadata_list = await loop.run_in_executor(None, fetch_all_metadata)
+        
+        if not metadata_list:
+            logging.info("  No wallpapers found in Firebase, cache remains empty")
+            return
+        
+        # Batch insert into cache
+        def batch_insert(metadata_list):
+            with metadata_cache_lock:
+                cursor = metadata_cache_conn.cursor()
+                cursor.executemany(
+                    '''INSERT OR REPLACE INTO wallpaper_metadata 
+                       (wallpaper_id, category, search_term, created_at, last_accessed) 
+                       VALUES (?, ?, ?, ?, ?)''',
+                    metadata_list
+                )
+                metadata_cache_conn.commit()
+        
+        await loop.run_in_executor(None, batch_insert, metadata_list)
+        
+        db_size_mb = os.path.getsize(METADATA_CACHE_DB_FILE) / (1024 * 1024)
+        logging.info(f"✓ Synced {len(metadata_list):,} wallpaper IDs from Firebase ({db_size_mb:.1f}MB)")
+        
+    except Exception as e:
+        logging.error(f"Failed to sync metadata cache from Firebase: {e}")
+        logging.error("Bot will continue but may have higher Firebase read costs")
+
+def close_metadata_cache_db():
+    """Close metadata cache database connection"""
+    global metadata_cache_conn
+    
+    try:
+        if metadata_cache_conn:
+            cursor = metadata_cache_conn.cursor()
+            logging.info("Optimizing metadata cache before shutdown...")
+            cursor.execute('ANALYZE')
+            cursor.execute('PRAGMA incremental_vacuum')
+            metadata_cache_conn.commit()
+            metadata_cache_conn.close()
+            logging.info("✓ Metadata cache closed and optimized")
+    except Exception as e:
+        logging.error(f"Error closing metadata cache: {e}")
 
 def load_rate_limit_state():
     """Load rate limiting state from database"""
@@ -461,8 +710,9 @@ def increment_wallpaper_count():
 def handle_shutdown():
     global shutdown_requested
     shutdown_requested = True
-    logging.info("Shutdown requested. Closing cache database and waiting for ongoing tasks to complete...")
-    close_cache_db()  # Close database before shutdown
+    logging.info("Shutdown requested. Closing cache databases and waiting for ongoing tasks to complete...")
+    close_cache_db()  # Close hash cache database
+    close_metadata_cache_db()  # Close metadata cache database
 
 async def enforce_rate_limit():
     """Enforce Wallhaven API rate limit of 40 requests per minute"""
@@ -524,14 +774,26 @@ def load_wallhaven_api_key():
 
 def connect_to_firebase(cred_path):
     try:
+        logging.info(f"Connecting to Firebase using credentials: {cred_path}")
         if not firebase_admin._apps:
+            logging.info("Initializing Firebase Admin SDK...")
             cred = credentials.Certificate(cred_path)
             firebase_admin.initialize_app(cred)
+            logging.info("✓ Firebase Admin SDK initialized")
+        logging.info("Creating Firestore client...")
         db = firestore.client()
         logging.info("✓ Connected to Firebase Firestore")
         return db
+    except FileNotFoundError as e:
+        logging.error(f"Firebase credentials file not found: {cred_path}")
+        logging.error("Please ensure the FIREBASE_CREDENTIALS path is correct in your .env file")
+        sys.exit(1)
     except Exception as e:
         logging.error(f"Failed to connect to Firebase: {e}")
+        logging.error("This could be due to:")
+        logging.error("  - Invalid credentials file")
+        logging.error("  - Network connectivity issues")
+        logging.error("  - Firestore not enabled in your Firebase project")
         sys.exit(1)
 
 def load_categories_config():
@@ -705,7 +967,16 @@ def extract_tag_names(tags_data):
     return tag_names
 
 async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, category, search_term, api_key):
-    """Fetch wallpapers for a specific category and search term"""
+    """
+    Fetch wallpapers for a specific category and search term
+    
+    Duplicate Detection Strategy (Two-Tier Caching):
+    1. Check metadata cache (SQLite) first for wallpaper_id - FAST, no Firebase read
+    2. If cache miss, check Firebase and update cache - only on first encounter
+    3. This reduces Firebase read costs by ~99% for duplicate checks during fetching
+    
+    Note: SHA256-based duplicate detection happens later during posting phase
+    """
     
     if shutdown_requested:
         return
@@ -840,17 +1111,28 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 retry_delay = 5
                 added_flag = False
                 
+                # Check metadata cache first to avoid Firebase read
+                if check_metadata_cache(wallpaper_id):
+                    duplicates += 1
+                    if duplicates % 20 == 0:
+                        logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates (cached)...")
+                    continue  # Skip to next wallpaper
+                
                 for attempt in range(max_retries):
                     try:
-                        # Check if wallpaper already exists (Firestore doesn't have unique constraints)
+                        # Check Firebase as fallback (cache miss)
                         existing = wallpaper_collection.document(wallpaper_id).get()
                         if existing.exists:
                             duplicates += 1
+                            # Add to metadata cache for future
+                            add_to_metadata_cache(wallpaper_id, category, search_term)
                             if duplicates % 20 == 0:
                                 logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates so far...")
                         else:
                             wallpaper_collection.document(wallpaper_id).set(document)
                             added += 1
+                            # Add to metadata cache after successful insert
+                            add_to_metadata_cache(wallpaper_id, category, search_term)
                             increment_wallpaper_count()  # Track for rate limiting
                             tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
                             if added % 10 == 0 or added == target_count:
@@ -1656,14 +1938,22 @@ async def main():
     for cat in categories:
         logging.info(f"  - {cat['name']}: Group {cat['group_id']}, Every {cat['interval']}s, {len(cat['search_terms'])} terms")
     
-    # Initialize disk-based cache database
-    logging.info("Initializing cache database...")
-    init_cache_db()
+    # Initialize disk-based cache databases
+    logging.info("Initializing cache databases...")
+    init_cache_db()  # SHA256 hash cache for duplicate detection
+    
+    logging.info("Initializing metadata cache...")
+    init_metadata_cache_db()  # Wallpaper ID cache to avoid Firebase reads
     
     # Connect to Firebase
+    logging.info("")
+    logging.info("Connecting to Firebase Firestore...")
     db = connect_to_firebase(firebase_cred_path)
     wallpaper_collection = db.collection('wallhaven')
     state_collection = db.collection('fetch_state')
+    
+    # Sync metadata cache from Firebase (handles fresh deployment/crash recovery)
+    await sync_metadata_cache_from_firebase(wallpaper_collection)
     
     # Note: Firestore indexes are created automatically or via Firebase Console
     # Composite indexes needed:
