@@ -18,6 +18,8 @@ import subprocess
 import time
 import shutil
 import re
+import sqlite3
+import threading
 from functools import partial, wraps
 from urllib.parse import urlparse
 import requests
@@ -26,6 +28,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import firebase_admin
 from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
+from google.api_core.exceptions import ResourceExhausted, RetryError
+from PIL import Image
 
 # Load environment variables from .env file
 load_dotenv()
@@ -41,6 +45,24 @@ BOT_TOKEN = None
 MAX_REQUESTS_PER_MINUTE = 40
 api_call_times = []
 rate_limit_lock = None  # Will be initialized in main()
+
+# SQLite-based disk cache for duplicate hash checks (minimal RAM usage)
+CACHE_DB_FILE = "wallhaven_cache.db"  # SQLite database file
+CACHE_MAX_ENTRIES = 1000000  # 1 million entries (~120MB disk, excellent coverage)
+CACHE_CLEANUP_THRESHOLD = 0.9  # Cleanup when 90% full (900k entries)
+cache_db_conn = None  # Database connection
+cache_db_lock = None  # Thread lock for database access
+
+# Rate limiting for database writes (prevent Firebase quota exhaustion)
+MAX_WALLPAPERS_PER_PERIOD = 2000  # Maximum new wallpapers to add per period
+RATE_LIMIT_PERIOD_HOURS = 28  # Period duration in hours
+rate_limit_state = {  # Global rate limit state
+    'period_start': 0,
+    'wallpapers_added': 0,
+    'is_paused': False
+}
+
+FIRESTORE_QUOTA_BACKOFF = 60  # seconds to wait after quota error
 
 # Retry decorator for transient failures
 def retry_on_failure(max_attempts=3, delay=2, backoff=2):
@@ -83,10 +105,364 @@ def retry_on_failure(max_attempts=3, delay=2, backoff=2):
         return async_wrapper if asyncio.iscoroutinefunction(func) else sync_wrapper
     return decorator
 
+def init_cache_db():
+    """Initialize SQLite cache database optimized for long-term stability and minimal resources"""
+    global cache_db_conn, cache_db_lock
+    
+    try:
+        cache_db_lock = threading.Lock()
+        cache_db_conn = sqlite3.connect(CACHE_DB_FILE, check_same_thread=False)
+        cursor = cache_db_conn.cursor()
+        
+        # Create table with index on sha256 for fast lookups
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS duplicate_cache (
+                sha256 TEXT PRIMARY KEY,
+                wallpaper_id TEXT NOT NULL,
+                last_accessed INTEGER NOT NULL
+            )
+        ''')
+        
+        # Create index on last_accessed for efficient cleanup
+        cursor.execute('''
+            CREATE INDEX IF NOT EXISTS idx_last_accessed 
+            ON duplicate_cache(last_accessed)
+        ''')
+        
+        # Create table for rate limiting state
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rate_limit_state (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                period_start INTEGER NOT NULL,
+                wallpapers_added INTEGER NOT NULL,
+                last_updated INTEGER NOT NULL
+            )
+        ''')
+        
+        # Optimize SQLite for stability and minimal resource usage (not performance)
+        cursor.execute('PRAGMA journal_mode=DELETE')  # More stable than WAL, less disk usage
+        cursor.execute('PRAGMA synchronous=FULL')  # Maximum safety against corruption
+        cursor.execute('PRAGMA cache_size=-2000')  # Negative = KB, so 2MB cache (minimal)
+        cursor.execute('PRAGMA temp_store=MEMORY')  # Small temp tables in memory
+        cursor.execute('PRAGMA page_size=4096')  # Standard page size
+        cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')  # Gradual space reclamation
+        
+        # Perform incremental vacuum to reclaim space
+        cursor.execute('PRAGMA incremental_vacuum(100)')  # Reclaim up to 100 pages
+        
+        cache_db_conn.commit()
+        
+        # Get cache statistics
+        cursor.execute('SELECT COUNT(*) FROM duplicate_cache')
+        count = cursor.fetchone()[0]
+        
+        db_size_mb = os.path.getsize(CACHE_DB_FILE) / (1024 * 1024) if os.path.exists(CACHE_DB_FILE) else 0
+        
+        logging.info(f"✓ Cache database initialized: {count:,} entries, {db_size_mb:.1f}MB on disk")
+        logging.info(f"  Mode: Stability-optimized (max {CACHE_MAX_ENTRIES:,} entries, ~{CACHE_MAX_ENTRIES*0.12:.0f}MB disk)")
+        
+        # Load rate limit state
+        load_rate_limit_state()
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize cache database: {e}")
+        raise
+
+def check_cache_db(sha256):
+    """Check if SHA256 exists in cache database (disk-based, minimal RAM)"""
+    global cache_db_conn, cache_db_lock
+    
+    try:
+        with cache_db_lock:
+            cursor = cache_db_conn.cursor()
+            cursor.execute(
+                'SELECT wallpaper_id FROM duplicate_cache WHERE sha256 = ?',
+                (sha256,)
+            )
+            result = cursor.fetchone()
+            
+            if result:
+                # Update last_accessed timestamp
+                cursor.execute(
+                    'UPDATE duplicate_cache SET last_accessed = ? WHERE sha256 = ?',
+                    (int(time.time()), sha256)
+                )
+                cache_db_conn.commit()
+                return result[0]  # Return wallpaper_id
+            
+            return None
+    except Exception as e:
+        logging.error(f"Error checking cache database: {e}")
+        return None
+
+def add_to_cache_db(sha256, wallpaper_id):
+    """Add SHA256 to cache database"""
+    global cache_db_conn, cache_db_lock
+    
+    try:
+        with cache_db_lock:
+            cursor = cache_db_conn.cursor()
+            cursor.execute(
+                'INSERT OR REPLACE INTO duplicate_cache (sha256, wallpaper_id, last_accessed) VALUES (?, ?, ?)',
+                (sha256, wallpaper_id, int(time.time()))
+            )
+            cache_db_conn.commit()
+    except Exception as e:
+        logging.error(f"Error adding to cache database: {e}")
+
+def cleanup_old_cache_entries(max_entries=None):
+    """Remove oldest cache entries when threshold is reached"""
+    global cache_db_conn, cache_db_lock
+    
+    if max_entries is None:
+        max_entries = CACHE_MAX_ENTRIES
+    
+    try:
+        with cache_db_lock:
+            cursor = cache_db_conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM duplicate_cache')
+            count = cursor.fetchone()[0]
+            
+            # Start cleanup when 90% full to keep database smaller
+            cleanup_threshold = int(max_entries * CACHE_CLEANUP_THRESHOLD)
+            
+            if count > cleanup_threshold:
+                # Keep only 70% of max entries (remove oldest 30%)
+                target_size = int(max_entries * 0.7)
+                entries_to_delete = count - target_size
+                
+                cursor.execute('''
+                    DELETE FROM duplicate_cache 
+                    WHERE sha256 IN (
+                        SELECT sha256 FROM duplicate_cache 
+                        ORDER BY last_accessed ASC 
+                        LIMIT ?
+                    )
+                ''', (entries_to_delete,))
+                
+                cache_db_conn.commit()
+                
+                # Reclaim disk space after deletion
+                cursor.execute('PRAGMA incremental_vacuum')
+                
+                logging.info(f"Cleaned up {entries_to_delete:,} old cache entries (kept {target_size:,} most recent)")
+                
+                db_size_mb = os.path.getsize(CACHE_DB_FILE) / (1024 * 1024)
+                logging.info(f"  Cache database: {target_size:,} entries, {db_size_mb:.1f}MB")
+            else:
+                logging.debug(f"Cache size OK: {count:,}/{cleanup_threshold:,} entries")
+                
+    except Exception as e:
+        logging.error(f"Error cleaning up cache: {e}")
+
+async def verify_cache_integrity():
+    """Verify database integrity for long-term stability"""
+    global cache_db_conn, cache_db_lock
+    
+    try:
+        logging.info("Running cache database integrity check...")
+        
+        loop = asyncio.get_event_loop()
+        
+        def check_integrity():
+            with cache_db_lock:
+                cursor = cache_db_conn.cursor()
+                cursor.execute('PRAGMA integrity_check')
+                result = cursor.fetchone()[0]
+                return result
+        
+        result = await loop.run_in_executor(None, check_integrity)
+        
+        if result == 'ok':
+            logging.info("✓ Cache database integrity check passed")
+        else:
+            logging.error(f"Cache database integrity check failed: {result}")
+            logging.error("Consider rebuilding cache database")
+            
+    except Exception as e:
+        logging.error(f"Cache integrity check failed: {e}")
+
+async def cleanup_cache_task():
+    """Async wrapper for cache cleanup task"""
+    try:
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, cleanup_old_cache_entries)
+        logging.info("✓ Cache cleanup completed")
+    except Exception as e:
+        logging.error(f"Cache cleanup failed: {e}")
+
+async def maintenance_task():
+    """Weekly maintenance: integrity check and optimization"""
+    try:
+        logging.info("Starting weekly maintenance...")
+        
+        # Check integrity
+        await verify_cache_integrity()
+        
+        # Optimize database
+        loop = asyncio.get_event_loop()
+        
+        def optimize_db():
+            with cache_db_lock:
+                cursor = cache_db_conn.cursor()
+                # Analyze for query optimization
+                cursor.execute('ANALYZE')
+                # Reclaim unused space
+                cursor.execute('PRAGMA incremental_vacuum')
+                cache_db_conn.commit()
+        
+        await loop.run_in_executor(None, optimize_db)
+        
+        logging.info("✓ Weekly maintenance completed")
+    except Exception as e:
+        logging.error(f"Maintenance task failed: {e}")
+
+def close_cache_db():
+    """Close cache database connection with cleanup"""
+    global cache_db_conn
+    
+    try:
+        if cache_db_conn:
+            cursor = cache_db_conn.cursor()
+            
+            # Final optimization before closing
+            logging.info("Optimizing cache database before shutdown...")
+            cursor.execute('ANALYZE')  # Update statistics
+            cursor.execute('PRAGMA incremental_vacuum')  # Reclaim space
+            
+            cache_db_conn.commit()
+            cache_db_conn.close()
+            logging.info("✓ Cache database closed and optimized")
+    except Exception as e:
+        logging.error(f"Error closing cache database: {e}")
+
+def load_rate_limit_state():
+    """Load rate limiting state from database"""
+    global rate_limit_state, cache_db_conn, cache_db_lock
+    
+    try:
+        with cache_db_lock:
+            cursor = cache_db_conn.cursor()
+            cursor.execute('SELECT period_start, wallpapers_added FROM rate_limit_state WHERE id = 1')
+            result = cursor.fetchone()
+            
+            if result:
+                period_start, wallpapers_added = result
+                current_time = int(time.time())
+                period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
+                
+                # Check if period has expired
+                if current_time - period_start >= period_duration_seconds:
+                    # Start new period
+                    rate_limit_state['period_start'] = current_time
+                    rate_limit_state['wallpapers_added'] = 0
+                    rate_limit_state['is_paused'] = False
+                    save_rate_limit_state()
+                    logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
+                else:
+                    # Continue existing period
+                    rate_limit_state['period_start'] = period_start
+                    rate_limit_state['wallpapers_added'] = wallpapers_added
+                    rate_limit_state['is_paused'] = wallpapers_added >= MAX_WALLPAPERS_PER_PERIOD
+                    
+                    remaining = MAX_WALLPAPERS_PER_PERIOD - wallpapers_added
+                    time_left_hours = (period_start + period_duration_seconds - current_time) / 3600
+                    
+                    if rate_limit_state['is_paused']:
+                        logging.info(f"⏸ Rate limit reached: {wallpapers_added}/{MAX_WALLPAPERS_PER_PERIOD} wallpapers added")
+                        logging.info(f"  Fetching paused. Resumes in {time_left_hours:.1f} hours. Posting continues.")
+                    else:
+                        logging.info(f"✓ Rate limit state: {wallpapers_added}/{MAX_WALLPAPERS_PER_PERIOD} wallpapers added")
+                        logging.info(f"  Remaining: {remaining} wallpapers, Period resets in {time_left_hours:.1f}h")
+            else:
+                # Initialize new state
+                current_time = int(time.time())
+                rate_limit_state['period_start'] = current_time
+                rate_limit_state['wallpapers_added'] = 0
+                rate_limit_state['is_paused'] = False
+                save_rate_limit_state()
+                logging.info(f"✓ Rate limit initialized (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
+                
+    except Exception as e:
+        logging.error(f"Error loading rate limit state: {e}")
+        # Use defaults on error
+        rate_limit_state['period_start'] = int(time.time())
+        rate_limit_state['wallpapers_added'] = 0
+        rate_limit_state['is_paused'] = False
+
+def save_rate_limit_state():
+    """Save rate limiting state to database"""
+    global rate_limit_state, cache_db_conn, cache_db_lock
+    
+    try:
+        with cache_db_lock:
+            cursor = cache_db_conn.cursor()
+            cursor.execute('''
+                INSERT OR REPLACE INTO rate_limit_state (id, period_start, wallpapers_added, last_updated)
+                VALUES (1, ?, ?, ?)
+            ''', (
+                rate_limit_state['period_start'],
+                rate_limit_state['wallpapers_added'],
+                int(time.time())
+            ))
+            cache_db_conn.commit()
+    except Exception as e:
+        logging.error(f"Error saving rate limit state: {e}")
+
+def check_rate_limit():
+    """Check if we can add more wallpapers (returns True if allowed)"""
+    global rate_limit_state
+    
+    current_time = int(time.time())
+    period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
+    
+    # Check if period has expired
+    if current_time - rate_limit_state['period_start'] >= period_duration_seconds:
+        # Start new period
+        rate_limit_state['period_start'] = current_time
+        rate_limit_state['wallpapers_added'] = 0
+        rate_limit_state['is_paused'] = False
+        save_rate_limit_state()
+        logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
+        return True
+    
+    # Check if limit reached
+    if rate_limit_state['wallpapers_added'] >= MAX_WALLPAPERS_PER_PERIOD:
+        if not rate_limit_state['is_paused']:
+            rate_limit_state['is_paused'] = True
+            time_left_hours = (rate_limit_state['period_start'] + period_duration_seconds - current_time) / 3600
+            logging.info(f"⏸ Rate limit reached: {rate_limit_state['wallpapers_added']}/{MAX_WALLPAPERS_PER_PERIOD} wallpapers added")
+            logging.info(f"  Fetching paused for {time_left_hours:.1f} hours. Posting continues normally.")
+        return False
+    
+    return True
+
+def increment_wallpaper_count():
+    """Increment wallpaper counter after successful add"""
+    global rate_limit_state
+    
+    rate_limit_state['wallpapers_added'] += 1
+    save_rate_limit_state()
+    
+    remaining = MAX_WALLPAPERS_PER_PERIOD - rate_limit_state['wallpapers_added']
+    
+    # Log progress at milestones
+    if rate_limit_state['wallpapers_added'] % 100 == 0:
+        logging.info(f"  Rate limit: {rate_limit_state['wallpapers_added']}/{MAX_WALLPAPERS_PER_PERIOD} wallpapers added ({remaining} remaining)")
+    
+    # Check if limit just reached
+    if rate_limit_state['wallpapers_added'] >= MAX_WALLPAPERS_PER_PERIOD:
+        current_time = int(time.time())
+        period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
+        time_left_hours = (rate_limit_state['period_start'] + period_duration_seconds - current_time) / 3600
+        logging.info(f"🛑 Rate limit reached: {MAX_WALLPAPERS_PER_PERIOD}/{MAX_WALLPAPERS_PER_PERIOD} wallpapers added")
+        logging.info(f"  Fetching will pause. Resumes in {time_left_hours:.1f} hours. Posting continues.")
+
 def handle_shutdown():
     global shutdown_requested
     shutdown_requested = True
-    logging.info("Shutdown requested. Waiting for ongoing tasks to complete...")
+    logging.info("Shutdown requested. Closing cache database and waiting for ongoing tasks to complete...")
+    close_cache_db()  # Close database before shutdown
 
 async def enforce_rate_limit():
     """Enforce Wallhaven API rate limit of 40 requests per minute"""
@@ -258,30 +634,47 @@ def get_fetch_state(state_collection, category, search_term):
 
 def update_fetch_state(state_collection, category, search_term):
     """Update fetch state to next round with smart pagination"""
-    try:
-        state = get_fetch_state(state_collection, category, search_term)
-        
-        current_round = state['round']
-        next_round = current_round + 1
-        next_target = next_round * 100
-        
-        # Smart skip calculation for high rounds
-        if next_target >= 800:
-            next_skip = next_target - 500
-        else:
-            next_skip = 0
-        
-        doc_id = f"{category}_{search_term}".replace(' ', '_').replace('/', '_')
-        state_collection.document(doc_id).update({
-            "round": next_round,
-            "target_count": next_target,
-            "skip_count": next_skip,
-            "last_updated": int(time.time())
-        })
-        
-        logging.info(f"[{category}:{search_term}] Advanced to round {next_round} (target: {next_target}, skip: {next_skip})")
-    except Exception as e:
-        logging.error(f"Error updating fetch state for {category}:{search_term}: {e}")
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            state = get_fetch_state(state_collection, category, search_term)
+            
+            current_round = state['round']
+            next_round = current_round + 1
+            next_target = next_round * 100
+            
+            # Smart skip calculation for high rounds
+            if next_target >= 800:
+                next_skip = next_target - 500
+            else:
+                next_skip = 0
+            
+            doc_id = f"{category}_{search_term}".replace(' ', '_').replace('/', '_')
+            state_collection.document(doc_id).update({
+                "round": next_round,
+                "target_count": next_target,
+                "skip_count": next_skip,
+                "last_updated": int(time.time())
+            })
+            
+            logging.info(f"[{category}:{search_term}] Advanced to round {next_round} (target: {next_target}, skip: {next_skip})")
+            return  # Success
+        except (ResourceExhausted, RetryError) as e:
+            if "Quota exceeded" in str(e):
+                if attempt < max_retries - 1:
+                    logging.warning(f"Quota exceeded updating fetch state for {category}:{search_term}, retry {attempt + 1}/{max_retries} in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logging.error(f"Error updating fetch state for {category}:{search_term}: {e}")
+            else:
+                logging.error(f"Error updating fetch state for {category}:{search_term}: {e}")
+                return
+        except Exception as e:
+            logging.error(f"Error updating fetch state for {category}:{search_term}: {e}")
+            return
 
 def sanitize_search_term(search_term):
     """Sanitize search term to prevent injection and API errors"""
@@ -315,6 +708,14 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
     """Fetch wallpapers for a specific category and search term"""
     
     if shutdown_requested:
+        return
+    
+    # Check rate limit before starting fetch
+    if not check_rate_limit():
+        current_time = int(time.time())
+        period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
+        time_left_hours = (rate_limit_state['period_start'] + period_duration_seconds - current_time) / 3600
+        logging.debug(f"[{category}:{search_term}] Skipping fetch - rate limit reached. Resumes in {time_left_hours:.1f}h")
         return
     
     state = get_fetch_state(state_collection, category, search_term)
@@ -396,7 +797,10 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 break
             
             for wallpaper in wallpapers:
-                if shutdown_requested or added >= target_count:
+                # Check if we should stop (shutdown, target reached, or rate limit hit)
+                if shutdown_requested or added >= target_count or not check_rate_limit():
+                    if not check_rate_limit():
+                        logging.info(f"\n🛑 Rate limit reached. Stopping fetch for {category}:{search_term}")
                     break
                 
                 processed += 1
@@ -431,22 +835,55 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                     "created_at": current_timestamp
                 }
                 
-                try:
-                    # Check if wallpaper already exists (Firestore doesn't have unique constraints)
-                    existing = wallpaper_collection.document(wallpaper_id).get()
-                    if existing.exists:
-                        duplicates += 1
-                        if duplicates % 20 == 0:
-                            logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates so far...")
-                    else:
-                        wallpaper_collection.document(wallpaper_id).set(document)
-                        added += 1
-                        tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
-                        if added % 10 == 0 or added == target_count:
-                            logging.info(f"  [{added}/{target_count}] ✓ Added: {wallpaper_id} ({purity}){tag_info}")
-                except Exception as e:
-                    errors += 1
-                    logging.error(f"Error adding {wallpaper_id}: {e}")
+                # Add quota-aware error handling
+                max_retries = 3
+                retry_delay = 5
+                added_flag = False
+                
+                for attempt in range(max_retries):
+                    try:
+                        # Check if wallpaper already exists (Firestore doesn't have unique constraints)
+                        existing = wallpaper_collection.document(wallpaper_id).get()
+                        if existing.exists:
+                            duplicates += 1
+                            if duplicates % 20 == 0:
+                                logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates so far...")
+                        else:
+                            wallpaper_collection.document(wallpaper_id).set(document)
+                            added += 1
+                            increment_wallpaper_count()  # Track for rate limiting
+                            tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
+                            if added % 10 == 0 or added == target_count:
+                                logging.info(f"  [{added}/{target_count}] ✓ Added: {wallpaper_id} ({purity}){tag_info}")
+                        added_flag = True
+                        break  # Success, exit retry loop
+                    except (ResourceExhausted, RetryError) as e:
+                        if "Quota exceeded" in str(e):
+                            if attempt < max_retries - 1:
+                                logging.warning(f"Quota exceeded while adding {wallpaper_id}, waiting {retry_delay}s before retry...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 2
+                            else:
+                                errors += 1
+                                logging.error(f"Error adding {wallpaper_id}: {e}")
+                        else:
+                            errors += 1
+                            logging.error(f"Error adding {wallpaper_id}: {e}")
+                            break
+                    except Exception as e:
+                        errors += 1
+                        logging.error(f"Error adding {wallpaper_id}: {e}")
+                        break
+                
+                # If quota errors persist, slow down
+                if not added_flag and errors > 0:
+                    logging.warning("Rate limiting due to quota issues, sleeping 30s...")
+                    await asyncio.sleep(30)
+            
+            # Check rate limit after processing wallpaper
+            if not check_rate_limit():
+                logging.info(f"\n🛑 Rate limit reached during fetch. Stopping early.")
+                break
             
             page += 1
             
@@ -483,6 +920,20 @@ async def wallpaper_fetcher_task(db, api_key, categories):
     logging.info("🔄 Wallpaper fetcher task started")
     
     while not shutdown_requested:
+        # Check rate limit at start of each cycle
+        if not check_rate_limit():
+            current_time = int(time.time())
+            period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
+            time_left_seconds = rate_limit_state['period_start'] + period_duration_seconds - current_time
+            time_left_hours = time_left_seconds / 3600
+            
+            logging.info(f"⏸ Fetcher paused - rate limit reached ({rate_limit_state['wallpapers_added']}/{MAX_WALLPAPERS_PER_PERIOD})")
+            logging.info(f"  Will resume in {time_left_hours:.1f} hours. Sleeping for 1 hour, then checking again...")
+            
+            # Sleep for 1 hour and check again (in case bot restarted or period expired)
+            await asyncio.sleep(3600)  # 1 hour
+            continue
+        
         for category_config in categories:
             if shutdown_requested:
                 break
@@ -536,16 +987,53 @@ def calculate_hashes(filepath):
         return None
 
 def check_duplicate_hashes(collection, sha256):
-    # Query Firestore for existing document with same SHA256
-    docs = collection.where(filter=FieldFilter('sha256', '==', sha256)).limit(1).stream()
-    for doc in docs:
+    # Check disk-based cache first to reduce Firestore reads (minimal RAM usage)
+    cached_wallpaper_id = check_cache_db(sha256)
+    if cached_wallpaper_id:
         return "duplicate", {
             "reason": "Duplicate",
             "details": {
-                "type": "SHA256_match",
-                "wallpaper_id": doc.to_dict().get('wallpaper_id')
+                "type": "SHA256_match_cached",
+                "wallpaper_id": cached_wallpaper_id
             }
         }
+    
+    # Query Firestore with retry logic for quota errors
+    max_retries = 3
+    retry_delay = FIRESTORE_QUOTA_BACKOFF
+    
+    for attempt in range(max_retries):
+        try:
+            docs = collection.where(filter=FieldFilter('sha256', '==', sha256)).limit(1).stream()
+            for doc in docs:
+                wallpaper_id = doc.to_dict().get('wallpaper_id')
+                # Add to disk cache
+                add_to_cache_db(sha256, wallpaper_id)
+                
+                return "duplicate", {
+                    "reason": "Duplicate",
+                    "details": {
+                        "type": "SHA256_match",
+                        "wallpaper_id": wallpaper_id
+                    }
+                }
+            return "proceed", None
+        except (ResourceExhausted, RetryError) as e:
+            if "Quota exceeded" in str(e):
+                if attempt < max_retries - 1:
+                    logging.warning(f"Firestore quota exceeded, waiting {retry_delay}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logging.error(f"Firestore quota exceeded after {max_retries} retries. Treating as non-duplicate to continue.")
+                    return "proceed", None
+            else:
+                raise
+        except Exception as e:
+            logging.error(f"Error checking duplicate hashes: {e}")
+            # On other errors, proceed to avoid blocking
+            return "proceed", None
+    
     return "proceed", None
 
 @retry_on_failure(max_attempts=3, delay=2, backoff=2)
@@ -579,8 +1067,84 @@ async def download_image(url, filename):
                 pass
         raise  # Re-raise for retry decorator
 
+def validate_image_dimensions(image_path):
+    """Validate image dimensions for Telegram compatibility"""
+    try:
+        with Image.open(image_path) as img:
+            width, height = img.size
+            # Telegram photo requirements:
+            # - Sum of width and height must not exceed 10000
+            # - Aspect ratio must be reasonable (not too extreme)
+            if width + height > 10000:
+                logging.warning(f"Image dimensions too large: {width}x{height}")
+                return False
+            if width < 1 or height < 1:
+                logging.warning(f"Invalid image dimensions: {width}x{height}")
+                return False
+            # Check aspect ratio (avoid extreme ratios)
+            aspect_ratio = max(width, height) / min(width, height)
+            if aspect_ratio > 20:
+                logging.warning(f"Extreme aspect ratio: {aspect_ratio:.1f}")
+                return False
+            return True
+    except Exception as e:
+        logging.error(f"Error validating image dimensions: {e}")
+        return False
+
 async def generate_thumbnail(image_path, max_size_kb=200):
-    """Generate thumbnail using ImageMagick asynchronously"""
+    """Generate thumbnail using PIL to ensure compatibility and size limits"""
+    try:
+        # Validate file extension
+        base, ext = os.path.splitext(image_path)
+        if not ext:
+            logging.error(f"No file extension for: {image_path}")
+            return None
+        thumb_path = base + '_thumb.jpg'
+        
+        # Use PIL for more reliable thumbnail generation
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _create_thumbnail_sync, image_path, thumb_path, max_size_kb)
+        
+        if os.path.exists(thumb_path):
+            size_kb = os.path.getsize(thumb_path) / 1024
+            logging.info(f"Generated thumbnail: {size_kb:.1f}KB")
+            return thumb_path
+        return None
+    except Exception as e:
+        logging.error(f"Error generating thumbnail: {e}")
+        return None
+
+def _create_thumbnail_sync(image_path, thumb_path, max_size_kb):
+    """Synchronous thumbnail creation with size optimization"""
+    try:
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Create thumbnail
+            img.thumbnail((320, 320), Image.Resampling.LANCZOS)
+            
+            # Save with progressively lower quality until under max_size_kb
+            quality = 85
+            while quality >= 20:
+                img.save(thumb_path, 'JPEG', quality=quality, optimize=True)
+                size_kb = os.path.getsize(thumb_path) / 1024
+                if size_kb <= max_size_kb:
+                    break
+                quality -= 10
+    except Exception as e:
+        logging.error(f"Error in _create_thumbnail_sync: {e}")
+        raise
+
+async def generate_thumbnail_legacy(image_path, max_size_kb=200):
+    """Legacy ImageMagick thumbnail generation (fallback)"""
     try:
         # Validate file extension (FIX #9)
         base, ext = os.path.splitext(image_path)
@@ -650,68 +1214,103 @@ async def generate_thumbnail(image_path, max_size_kb=200):
         gc.collect()
 
 def get_pending_wallpapers(collection, category, count=3):
-    try:
-        # Query all matching documents
-        query = collection.where(filter=FieldFilter('category', '==', category)).where(filter=FieldFilter('status', '==', 'link_added'))
-        docs = list(query.stream())
-        
-        if not docs:
+    max_retries = 3
+    retry_delay = FIRESTORE_QUOTA_BACKOFF
+    
+    for attempt in range(max_retries):
+        try:
+            # Query all matching documents
+            query = collection.where(filter=FieldFilter('category', '==', category)).where(filter=FieldFilter('status', '==', 'link_added'))
+            docs = list(query.stream())
+            
+            if not docs:
+                return []
+            
+            # Randomly sample from results
+            fetch_count = min(count, len(docs))
+            sampled_docs = random.sample(docs, fetch_count)
+            
+            # Convert to dictionaries and add wallpaper_id from document ID
+            result = []
+            for doc in sampled_docs:
+                data = doc.to_dict()
+                if 'wallpaper_id' not in data:
+                    data['wallpaper_id'] = doc.id
+                result.append(data)
+            
+            return result
+        except (ResourceExhausted, RetryError) as e:
+            if "Quota exceeded" in str(e):
+                if attempt < max_retries - 1:
+                    logging.warning(f"Database query quota exceeded for {category}, waiting {retry_delay}s before retry {attempt + 1}/{max_retries}...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+                else:
+                    logging.error(f"Database query failed for category {category} after {max_retries} retries: {e}")
+                    return []  # Return empty to avoid crash
+            else:
+                raise
+        except Exception as e:
+            logging.error(f"Database query failed for category {category}: {e}")
+            # Return empty on other errors to continue operation
             return []
-        
-        # Randomly sample from results
-        fetch_count = min(count, len(docs))
-        sampled_docs = random.sample(docs, fetch_count)
-        
-        # Convert to dictionaries and add wallpaper_id from document ID
-        result = []
-        for doc in sampled_docs:
-            data = doc.to_dict()
-            if 'wallpaper_id' not in data:
-                data['wallpaper_id'] = doc.id
-            result.append(data)
-        
-        return result
-    except Exception as e:
-        logging.error(f"Database query failed for category {category}: {e}")
-        # Re-raise to distinguish from empty results
-        raise
 
 def update_wallpaper_status(collection, wallpaper_id, status, sha256=None, 
                            tg_response=None, reasons=None):
-    try:
-        update_data = {"status": status}
-        if sha256:
-            update_data["sha256"] = sha256
-        
-        # Build tg_response atomically
-        if tg_response:
-            if not isinstance(tg_response, dict):
-                logging.error(f"Invalid tg_response type for {wallpaper_id}: {type(tg_response)}. Rejecting update.")
-                return  # Don't update with invalid data
-            update_data["tg_response"] = tg_response
-        
-        if reasons:
-            if not isinstance(reasons, dict):
-                logging.error(f"Invalid reasons type for {wallpaper_id}: {type(reasons)}. Rejecting update.")
-                return  # Don't update with invalid data
+    max_retries = 3
+    retry_delay = 5
+    
+    for attempt in range(max_retries):
+        try:
+            update_data = {"status": status}
+            if sha256:
+                update_data["sha256"] = sha256
+                # Add to disk cache when status is updated with sha256
+                if status == "posted":
+                    add_to_cache_db(sha256, wallpaper_id)
             
-            # Merge reasons into tg_response
-            if "tg_response" in update_data:
-                update_data["tg_response"].update(reasons)
-            else:
-                # Get existing tg_response and merge
-                doc = collection.document(wallpaper_id).get()
-                if doc.exists:
-                    existing_tg = doc.to_dict().get('tg_response', {})
-                    existing_tg.update(reasons)
-                    update_data["tg_response"] = existing_tg
+            # Build tg_response atomically
+            if tg_response:
+                if not isinstance(tg_response, dict):
+                    logging.error(f"Invalid tg_response type for {wallpaper_id}: {type(tg_response)}. Rejecting update.")
+                    return  # Don't update with invalid data
+                update_data["tg_response"] = tg_response
+            
+            if reasons:
+                if not isinstance(reasons, dict):
+                    logging.error(f"Invalid reasons type for {wallpaper_id}: {type(reasons)}. Rejecting update.")
+                    return  # Don't update with invalid data
+                
+                # Merge reasons into tg_response
+                if "tg_response" in update_data:
+                    update_data["tg_response"].update(reasons)
                 else:
-                    update_data["tg_response"] = reasons
-        
-        # Update using document reference
-        collection.document(wallpaper_id).update(update_data)
-    except Exception as e:
-        logging.error(f"Failed to update wallpaper {wallpaper_id}: {e}")
+                    # Get existing tg_response and merge
+                    doc = collection.document(wallpaper_id).get()
+                    if doc.exists:
+                        existing_tg = doc.to_dict().get('tg_response', {})
+                        existing_tg.update(reasons)
+                        update_data["tg_response"] = existing_tg
+                    else:
+                        update_data["tg_response"] = reasons
+            
+            # Update using document reference
+            collection.document(wallpaper_id).update(update_data)
+            return  # Success
+        except (ResourceExhausted, RetryError) as e:
+            if "Quota exceeded" in str(e):
+                if attempt < max_retries - 1:
+                    logging.warning(f"Quota exceeded updating {wallpaper_id}, retry {attempt + 1}/{max_retries} in {retry_delay}s...")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    logging.error(f"Failed to update wallpaper {wallpaper_id} after {max_retries} retries: {e}")
+            else:
+                logging.error(f"Failed to update wallpaper {wallpaper_id}: {e}")
+                return
+        except Exception as e:
+            logging.error(f"Failed to update wallpaper {wallpaper_id}: {e}")
+            return
 
 def telegram_send_photo(chat_id, photo_path):
     """Send photo using Telegram Bot API"""
@@ -871,15 +1470,33 @@ async def send_wallpaper_to_group(collection, category, group_id):
             # Track file for cleanup
             downloaded_files.append(path)
             
+            # Validate image dimensions for Telegram
+            if not validate_image_dimensions(path):
+                reasons = {"reason": "Invalid dimensions for Telegram"}
+                update_wallpaper_status(collection, wallpaper_id, "failed", reasons=reasons)
+                logging.error(f"[{category}] Invalid dimensions for {wallpaper_id}")
+                continue
+            
             file_size_mb = os.path.getsize(path) / (1024 * 1024)
             thumbnail_path = None
-            if file_size_mb > 9.5:
-                logging.info(f"[{category}] File size {file_size_mb:.2f}MB > 9.5MB, generating thumbnail...")
-                thumbnail_path = await generate_thumbnail(path)
+            
+            # Only generate thumbnail for HD document if file > 9MB
+            # Preview photos will be sent without thumbnail (Telegram auto-compresses)
+            if file_size_mb > 9.0:
+                logging.info(f"[{category}] File size {file_size_mb:.2f}MB > 9.0MB, generating thumbnail for HD document...")
+                thumbnail_path = await generate_thumbnail(path, max_size_kb=150)
                 if thumbnail_path:
                     downloaded_files.append(thumbnail_path)
+                    # Verify thumbnail is reasonable
+                    thumb_size_mb = os.path.getsize(thumbnail_path) / (1024 * 1024)
+                    if thumb_size_mb > 1.0:  # Thumbnail shouldn't be > 1MB
+                        logging.warning(f"[{category}] Thumbnail too large ({thumb_size_mb:.2f}MB), creating smaller one...")
+                        thumbnail_path = await generate_thumbnail(path, max_size_kb=100)
+                        if thumbnail_path:
+                            downloaded_files.append(thumbnail_path)
                 else:
-                    logging.warning(f"[{category}] Failed to generate thumbnail for {wallpaper_id}, proceeding without it")
+                    logging.warning(f"[{category}] Failed to generate thumbnail for {wallpaper_id}")
+                    # Continue anyway - document can be sent without thumbnail
             
             sha256 = calculate_hashes(path)
             if not sha256:
@@ -913,40 +1530,23 @@ async def send_wallpaper_to_group(collection, category, group_id):
         logging.info(f"[{category}] Sending {len(wallpaper_data)} wallpapers to Telegram...")
         
         try:
-            # Send preview photos
+            # Send preview photos (Telegram will auto-compress, we don't need thumbnails)
             preview_responses = telegram_send_media_group(group_id, wallpaper_data, is_document=False)
             if not preview_responses:
                 raise Exception("Failed to send preview images")
             
             await asyncio.sleep(3)
             
-            # Send HD versions
-            has_large_files = any(item['thumbnail'] is not None for item in wallpaper_data)
-            
-            # Track responses per wallpaper ID (FIX: proper mapping)
+            # Send HD versions as documents
+            # Only files > 9MB have thumbnails attached
             hd_responses_map = {}  # wallpaper_id -> response
             
-            if has_large_files:
-                # Send individually and map by wallpaper_id
-                for idx, item in enumerate(wallpaper_data):
-                    response = telegram_send_document(group_id, item['path'], item['thumbnail'])
-                    hd_responses_map[item['wallpaper_id']] = response
-                    await asyncio.sleep(0.5)
-                hd_responses = None  # Not used in this case
-            else:
-                # Send as group
-                hd_responses = telegram_send_media_group(group_id, wallpaper_data, is_document=True)
-                # Map group responses to wallpaper IDs
-                if hd_responses and isinstance(hd_responses, dict):
-                    hd_result_list = hd_responses.get('result', [])
-                    for idx, item in enumerate(wallpaper_data):
-                        if idx < len(hd_result_list):
-                            hd_responses_map[item['wallpaper_id']] = {'result': hd_result_list[idx]}
-                        else:
-                            hd_responses_map[item['wallpaper_id']] = None
-                else:
-                    for item in wallpaper_data:
-                        hd_responses_map[item['wallpaper_id']] = None
+            # Always send documents individually for better control
+            for idx, item in enumerate(wallpaper_data):
+                # thumbnail_path will be None if file < 9MB (fine, optional parameter)
+                response = telegram_send_document(group_id, item['path'], item['thumbnail'])
+                hd_responses_map[item['wallpaper_id']] = response
+                await asyncio.sleep(0.5)
             
             # Update database - only mark as posted if both uploads succeeded
             preview_result_list = preview_responses.get('result', [])
@@ -1056,6 +1656,10 @@ async def main():
     for cat in categories:
         logging.info(f"  - {cat['name']}: Group {cat['group_id']}, Every {cat['interval']}s, {len(cat['search_terms'])} terms")
     
+    # Initialize disk-based cache database
+    logging.info("Initializing cache database...")
+    init_cache_db()
+    
     # Connect to Firebase
     db = connect_to_firebase(firebase_cred_path)
     wallpaper_collection = db.collection('wallhaven')
@@ -1109,6 +1713,26 @@ async def main():
         else:
             logging.info(f"⏸ Scheduled '{category}' (every {interval}s / {interval//60}min) - Waiting for wallpapers...")
     
+    # Schedule daily cache cleanup (runs when 90% full)
+    scheduler.add_job(
+        cleanup_cache_task,
+        'interval',
+        hours=24,
+        id='cache_cleanup',
+        max_instances=1
+    )
+    logging.info(f"✓ Scheduled daily cache cleanup (max {CACHE_MAX_ENTRIES:,} entries)")
+    
+    # Schedule weekly maintenance (integrity check + optimization)
+    scheduler.add_job(
+        maintenance_task,
+        'interval',
+        days=7,
+        id='cache_maintenance',
+        max_instances=1
+    )
+    logging.info("✓ Scheduled weekly cache maintenance (integrity check + optimization)")
+    
     scheduler.start()
     logging.info("=" * 70)
     logging.info("✅ Bot is running")
@@ -1127,6 +1751,10 @@ async def main():
         await asyncio.gather(*ACTIVE_TASKS, return_exceptions=True)
     
     scheduler.shutdown()
+    
+    # Close cache database
+    logging.info("Closing cache database...")
+    close_cache_db()
     
     logging.info("=" * 70)
     logging.info("Bot stopped gracefully. All tasks completed.")

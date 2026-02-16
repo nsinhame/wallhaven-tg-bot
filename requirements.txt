@@ -3,7 +3,7 @@
 #
 # This bot uses:
 # - Direct Telegram Bot API (simple HTTP requests)
-# - ImageMagick for thumbnails (external command)
+# - PIL/Pillow for image processing and thumbnails
 # - Requests library for HTTP calls
 #
 # Memory usage: ~40-60MB
@@ -20,5 +20,5 @@ apscheduler>=3.10.0
 # Environment variable management
 python-dotenv>=1.0.0
 
-# System Requirements (not Python packages):
-# - ImageMagick: sudo apt install imagemagick
+# Image processing for thumbnails and validation
+Pillow>=10.0.0
