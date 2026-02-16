@@ -139,7 +139,7 @@ def init_cache_db():
     global cache_db_conn, cache_db_lock
     
     try:
-        cache_db_lock = threading.Lock()
+        cache_db_lock = threading.RLock()  # Use RLock to allow reentrant locking
         cache_db_conn = sqlite3.connect(CACHE_DB_FILE, check_same_thread=False)
         cursor = cache_db_conn.cursor()
         
@@ -377,7 +377,7 @@ def init_metadata_cache_db():
     global metadata_cache_conn, metadata_cache_lock
     
     try:
-        metadata_cache_lock = threading.Lock()
+        metadata_cache_lock = threading.RLock()  # Use RLock to allow reentrant locking
         metadata_cache_conn = sqlite3.connect(METADATA_CACHE_DB_FILE, check_same_thread=False)
         cursor = metadata_cache_conn.cursor()
         
