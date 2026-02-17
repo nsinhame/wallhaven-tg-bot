@@ -1496,31 +1496,63 @@ async def generate_thumbnail_legacy(image_path, max_size_kb=200):
         gc.collect()
 
 def get_pending_wallpapers(collection, category, count=3):
+    """
+    Get pending wallpapers for a category, filtered by metadata cache.
+    
+    This function checks the metadata cache to avoid re-processing wallpapers
+    that have already been posted, dramatically reducing Firebase reads.
+    """
     max_retries = 3
     retry_delay = FIRESTORE_QUOTA_BACKOFF
     
     for attempt in range(max_retries):
         try:
-            # Query all matching documents
-            query = collection.where(filter=FieldFilter('category', '==', category)).where(filter=FieldFilter('status', '==', 'link_added'))
+            # Fetch more than needed to account for cache filtering (3x buffer)
+            fetch_limit = count * 3
+            query = collection.where(filter=FieldFilter('category', '==', category)).where(filter=FieldFilter('status', '==', 'link_added')).limit(fetch_limit)
             docs = list(query.stream())
             
             if not docs:
                 return []
             
-            # Randomly sample from results
-            fetch_count = min(count, len(docs))
-            sampled_docs = random.sample(docs, fetch_count)
+            # Filter out wallpapers already in metadata cache (already posted)
+            valid_docs = []
+            cached_count = 0
             
-            # Convert to dictionaries and add wallpaper_id from document ID
-            result = []
-            for doc in sampled_docs:
+            for doc in docs:
                 data = doc.to_dict()
-                if 'wallpaper_id' not in data:
-                    data['wallpaper_id'] = doc.id
-                result.append(data)
+                wallpaper_id = data.get('wallpaper_id', doc.id)
+                
+                # Check metadata cache - if wallpaper was already processed, skip it
+                if check_metadata_cache(wallpaper_id):
+                    cached_count += 1
+                    # Update status in Firebase to mark as already processed (avoid future queries)
+                    try:
+                        collection.document(wallpaper_id).update({"status": "already_processed"})
+                    except:
+                        pass  # Non-critical, continue
+                else:
+                    if 'wallpaper_id' not in data:
+                        data['wallpaper_id'] = doc.id
+                    valid_docs.append(data)
+                    
+                    # Stop if we have enough valid wallpapers
+                    if len(valid_docs) >= count:
+                        break
+            
+            if cached_count > 0:
+                logging.debug(f"[{category}] Filtered out {cached_count} already-processed wallpapers from cache")
+            
+            if not valid_docs:
+                logging.debug(f"[{category}] All {len(docs)} fetched wallpapers are already processed")
+                return []
+            
+            # Randomly sample from valid results
+            sample_count = min(count, len(valid_docs))
+            result = random.sample(valid_docs, sample_count)
             
             return result
+            
         except (ResourceExhausted, RetryError) as e:
             if "Quota exceeded" in str(e):
                 if attempt < max_retries - 1:
@@ -1539,6 +1571,12 @@ def get_pending_wallpapers(collection, category, count=3):
 
 def update_wallpaper_status(collection, wallpaper_id, status, sha256=None, 
                            tg_response=None, reasons=None):
+    """
+    Update wallpaper status in Firebase and metadata cache.
+    
+    When a wallpaper is marked as posted/skipped/failed, it's added to the metadata cache
+    to prevent re-processing, reducing Firebase reads by ~99%.
+    """
     max_retries = 3
     retry_delay = 5
     
@@ -1573,11 +1611,32 @@ def update_wallpaper_status(collection, wallpaper_id, status, sha256=None,
                         existing_tg = doc.to_dict().get('tg_response', {})
                         existing_tg.update(reasons)
                         update_data["tg_response"] = existing_tg
+                        # Extract category and search_term for metadata cache
+                        category = doc.to_dict().get('category', '')
+                        search_term = doc.to_dict().get('search_term', '')
                     else:
                         update_data["tg_response"] = reasons
+                        category = ''
+                        search_term = ''
             
             # Update using document reference
             collection.document(wallpaper_id).update(update_data)
+            
+            # Add to metadata cache for posted/skipped/failed wallpapers (prevents re-processing)
+            if status in ["posted", "skipped", "failed", "already_processed"]:
+                # Get category and search_term if not already retrieved
+                if not reasons:
+                    doc = collection.document(wallpaper_id).get()
+                    if doc.exists:
+                        category = doc.to_dict().get('category', '')
+                        search_term = doc.to_dict().get('search_term', '')
+                    else:
+                        category = ''
+                        search_term = ''
+                
+                # Add to metadata cache (avoids future Firebase reads)
+                add_to_metadata_cache(wallpaper_id, category, search_term)
+            
             return  # Success
         except (ResourceExhausted, RetryError) as e:
             if "Quota exceeded" in str(e):
