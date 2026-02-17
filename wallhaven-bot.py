@@ -527,19 +527,29 @@ async def sync_metadata_cache_from_firebase(wallpaper_collection):
         
         loop = asyncio.get_event_loop()
         
-        # Fetch all wallpaper IDs from Firebase (only the fields we need)
+        # Fetch ONLY already-processed wallpapers from Firebase (posted/skipped/failed)
+        # Do NOT sync wallpapers with status='link_added' - they haven't been posted yet!
         def fetch_all_metadata():
-            docs = wallpaper_collection.select(['wallpaper_id', 'category', 'search_term', 'created_at']).stream()
+            docs = wallpaper_collection.select(['wallpaper_id', 'category', 'search_term', 'created_at', 'status']).stream()
             metadata_list = []
+            skipped_count = 0
             for doc in docs:
                 data = doc.to_dict()
-                metadata_list.append((
-                    data.get('wallpaper_id', doc.id),
-                    data.get('category', ''),
-                    data.get('search_term', ''),
-                    data.get('created_at', int(time.time())),
-                    int(time.time())  # last_accessed
-                ))
+                status = data.get('status', '')
+                
+                # Only sync wallpapers that have been processed (prevents re-posting)
+                if status in ['posted', 'skipped', 'failed', 'already_processed']:
+                    metadata_list.append((
+                        data.get('wallpaper_id', doc.id),
+                        data.get('category', ''),
+                        data.get('search_term', ''),
+                        data.get('created_at', int(time.time())),
+                        int(time.time())  # last_accessed
+                    ))
+                else:
+                    skipped_count += 1
+            
+            logging.info(f"  Syncing {len(metadata_list)} processed wallpapers, excluding {skipped_count} pending ones")
             return metadata_list
         
         metadata_list = await loop.run_in_executor(None, fetch_all_metadata)
@@ -1124,15 +1134,16 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                         existing = wallpaper_collection.document(wallpaper_id).get()
                         if existing.exists:
                             duplicates += 1
-                            # Add to metadata cache for future
-                            add_to_metadata_cache(wallpaper_id, category, search_term)
+                            # Don't add to metadata cache during fetching - only during posting!
+                            # This allows fetched wallpapers to be posted to Telegram
                             if duplicates % 20 == 0:
                                 logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates so far...")
                         else:
                             wallpaper_collection.document(wallpaper_id).set(document)
                             added += 1
-                            # Add to metadata cache after successful insert
-                            add_to_metadata_cache(wallpaper_id, category, search_term)
+                            # Don't add to metadata cache during fetching!
+                            # Metadata cache should only contain posted/skipped/failed wallpapers
+                            # This is the key fix to allow newly fetched wallpapers to be posted
                             increment_wallpaper_count()  # Track for rate limiting
                             tag_info = f" ({len(tags)} tags)" if tags else " (no tags)"
                             if added % 10 == 0 or added == target_count:
@@ -1513,11 +1524,14 @@ def get_pending_wallpapers(collection, category, count=3):
             docs = list(query.stream())
             
             if not docs:
+                logging.debug(f"[{category}] No pending wallpapers found in Firebase")
                 return []
             
             # Filter out wallpapers already in metadata cache (already posted)
             valid_docs = []
             cached_count = 0
+            
+            logging.debug(f"[{category}] Found {len(docs)} wallpapers with status='link_added', filtering...")
             
             for doc in docs:
                 data = doc.to_dict()
@@ -1541,15 +1555,17 @@ def get_pending_wallpapers(collection, category, count=3):
                         break
             
             if cached_count > 0:
-                logging.debug(f"[{category}] Filtered out {cached_count} already-processed wallpapers from cache")
+                logging.info(f"[{category}] Filtered {cached_count} already-posted wallpapers, {len(valid_docs)} available")
             
             if not valid_docs:
-                logging.debug(f"[{category}] All {len(docs)} fetched wallpapers are already processed")
+                logging.info(f"[{category}] All {len(docs)} fetched wallpapers have already been posted")
                 return []
             
             # Randomly sample from valid results
             sample_count = min(count, len(valid_docs))
             result = random.sample(valid_docs, sample_count)
+            
+            logging.info(f"[{category}] Selected {len(result)} wallpapers to post")
             
             return result
             
@@ -1775,6 +1791,7 @@ async def send_wallpaper_to_group(collection, category, group_id):
             return
         
         if not wallpapers:
+            logging.debug(f"[{category}] No pending wallpapers available to post")
             return  # Silently skip if no wallpapers
         
         logging.info(f"[{category}] Processing {len(wallpapers)} wallpapers as a group...")
