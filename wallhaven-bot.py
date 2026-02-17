@@ -428,11 +428,11 @@ def init_firebase_id_cache_db():
         
         db_size_mb = os.path.getsize(FIREBASE_ID_CACHE_DB_FILE) / (1024 * 1024) if os.path.exists(FIREBASE_ID_CACHE_DB_FILE) else 0
         
-        logging.info(f\"✓ Firebase ID cache initialized: {count:,} IDs, {db_size_mb:.1f}MB on disk\")
-        logging.info(f\"  Mode: Fast Firebase existence checks (max {FIREBASE_ID_CACHE_MAX_ENTRIES:,} entries)\")
+        logging.info(f"✓ Firebase ID cache initialized: {count:,} IDs, {db_size_mb:.1f}MB on disk")
+        logging.info(f"  Mode: Fast Firebase existence checks (max {FIREBASE_ID_CACHE_MAX_ENTRIES:,} entries)")
         
     except Exception as e:
-        logging.error(f\"Failed to initialize Firebase ID cache: {e}\")
+        logging.error(f"Failed to initialize Firebase ID cache: {e}")
         raise
 
 def check_firebase_id_cache(wallpaper_id):
@@ -449,7 +449,7 @@ def check_firebase_id_cache(wallpaper_id):
             result = cursor.fetchone()
             return result is not None
     except Exception as e:
-        logging.error(f\"Error checking Firebase ID cache: {e}\")
+        logging.error(f"Error checking Firebase ID cache: {e}")
         return False  # On error, return False to check Firebase as fallback
 
 def add_to_firebase_id_cache(wallpaper_id):
@@ -466,10 +466,10 @@ def add_to_firebase_id_cache(wallpaper_id):
             )
             firebase_id_cache_conn.commit()
     except Exception as e:
-        logging.error(f\"Error adding to Firebase ID cache: {e}\")
+        logging.error(f"Error adding to Firebase ID cache: {e}")
 
 def cleanup_firebase_id_cache():
-    \"\"\"Clean up old Firebase ID cache entries when threshold is reached\"\"\"
+    """Clean up old Firebase ID cache entries when threshold is reached"""
     global firebase_id_cache_conn, firebase_id_cache_lock
     
     try:
@@ -498,17 +498,17 @@ def cleanup_firebase_id_cache():
                 firebase_id_cache_conn.commit()
                 cursor.execute('PRAGMA incremental_vacuum')
                 
-                logging.info(f\"Cleaned up {entries_to_delete:,} old Firebase ID cache entries\")
+                logging.info(f"Cleaned up {entries_to_delete:,} old Firebase ID cache entries")
                 
     except Exception as e:
-        logging.error(f\"Error cleaning up Firebase ID cache: {e}\")
+        logging.error(f"Error cleaning up Firebase ID cache: {e}")
 
 async def sync_firebase_id_cache_from_firebase(wallpaper_collection):
-    \"\"\"Sync Firebase ID cache from Firebase (run on startup if cache is empty)\"\"\"
+    """Sync Firebase ID cache from Firebase (run on startup if cache is empty)"""
     global firebase_id_cache_conn, firebase_id_cache_lock
     
     try:
-        logging.info(\"Syncing Firebase ID cache from Firebase...\")
+        logging.info("Syncing Firebase ID cache from Firebase...")
         
         # Check if cache is empty
         with firebase_id_cache_lock:
@@ -517,11 +517,11 @@ async def sync_firebase_id_cache_from_firebase(wallpaper_collection):
             cache_count = cursor.fetchone()[0]
         
         if cache_count > 0:
-            logging.info(f\"  Firebase ID cache has {cache_count:,} entries, skipping full sync\")
+            logging.info(f"  Firebase ID cache has {cache_count:,} entries, skipping full sync")
             return
         
         # Cache is empty - rebuild from Firebase (sync ALL wallpapers)
-        logging.info(\"  Cache is empty, rebuilding from Firebase...\")
+        logging.info("  Cache is empty, rebuilding from Firebase...")
         
         loop = asyncio.get_event_loop()
         
@@ -538,7 +538,7 @@ async def sync_firebase_id_cache_from_firebase(wallpaper_collection):
         id_list = await loop.run_in_executor(None, fetch_all_ids)
         
         if not id_list:
-            logging.info(\"  No wallpapers found in Firebase, cache remains empty\")
+            logging.info("  No wallpapers found in Firebase, cache remains empty")
             return
         
         # Batch insert into cache
@@ -555,30 +555,30 @@ async def sync_firebase_id_cache_from_firebase(wallpaper_collection):
         await loop.run_in_executor(None, batch_insert, id_list)
         
         db_size_mb = os.path.getsize(FIREBASE_ID_CACHE_DB_FILE) / (1024 * 1024)
-        logging.info(f\"✓ Synced {len(id_list):,} wallpaper IDs from Firebase ({db_size_mb:.1f}MB)\")
+        logging.info(f"✓ Synced {len(id_list):,} wallpaper IDs from Firebase ({db_size_mb:.1f}MB)")
         
     except Exception as e:
-        logging.error(f\"Failed to sync Firebase ID cache from Firebase: {e}\")
-        logging.error(\"Bot will continue but may have higher Firebase read costs\")
+        logging.error(f"Failed to sync Firebase ID cache from Firebase: {e}")
+        logging.error("Bot will continue but may have higher Firebase read costs")
 
 def close_firebase_id_cache_db():
-    \"\"\"Close Firebase ID cache database connection\"\"\"
+    """Close Firebase ID cache database connection"""
     global firebase_id_cache_conn
     
     try:
         if firebase_id_cache_conn:
             cursor = firebase_id_cache_conn.cursor()
-            logging.info(\"Optimizing Firebase ID cache before shutdown...\")
+            logging.info("Optimizing Firebase ID cache before shutdown...")
             cursor.execute('ANALYZE')
             cursor.execute('PRAGMA incremental_vacuum')
             firebase_id_cache_conn.commit()
             firebase_id_cache_conn.close()
-            logging.info(\"✓ Firebase ID cache closed and optimized\")
+            logging.info("✓ Firebase ID cache closed and optimized")
     except Exception as e:
-        logging.error(f\"Error closing Firebase ID cache: {e}\")
+        logging.error(f"Error closing Firebase ID cache: {e}")
 
 def init_metadata_cache_db():
-    \"\"\"Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)\"\"\"
+    """Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)"""
     global metadata_cache_conn, metadata_cache_lock
     
     try:
