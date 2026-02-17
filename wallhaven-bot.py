@@ -47,9 +47,9 @@ api_call_times = []
 rate_limit_lock = None  # Will be initialized in main()
 
 # =============================================================================
-# DUAL-CACHE ARCHITECTURE FOR FIREBASE OPTIMIZATION
+# TRIPLE-CACHE ARCHITECTURE FOR FIREBASE OPTIMIZATION
 # =============================================================================
-# This bot uses TWO separate SQLite cache databases to minimize Firebase costs:
+# This bot uses THREE separate SQLite cache databases to minimize Firebase costs:
 #
 # 1. HASH CACHE (wallhaven_cache.db) - For image duplicate detection
 #    - Stores: SHA256 hashes of downloaded images
@@ -57,16 +57,24 @@ rate_limit_lock = None  # Will be initialized in main()
 #    - Purpose: Detect duplicate images (same content, different IDs)
 #    - Capacity: 1 million entries (~120MB disk)
 #
-# 2. METADATA CACHE (wallhaven_metadata_cache.db) - For wallpaper ID tracking
-#    - Stores: wallpaper_id, category, search_term
-#    - Used during: FETCHING phase (before image download)
-#    - Purpose: Avoid Firebase reads when checking if wallpaper exists
+# 2. FIREBASE ID CACHE (firebase_id_cache.db) - For wallpaper ID existence check
+#    - Stores: wallpaper_id (simple list of IDs in Firebase)
+#    - Populated: IMMEDIATELY when wallpaper added to Firebase during FETCHING
+#    - Purpose: Avoid Firebase reads when checking if ID already exists
+#    - Capacity: 500k entries (~20MB disk)
+#    - Growth rate: 5,000 entries/day (matches fetch rate)
+#
+# 3. METADATA CACHE (wallhaven_metadata_cache.db) - For processed wallpaper tracking
+#    - Stores: wallpaper_id, category, search_term, status
+#    - Populated: When wallpaper is posted/skipped/failed (status change)
+#    - Purpose: Track wallpapers that have been processed by Telegram poster
 #    - Capacity: 500k entries (~50MB disk)
-#    - Recovery: Syncs from Firebase on startup if cache is empty
+#    - Growth rate: 100 entries/day (matches posting rate)
 #
 # Cost Savings:
-# - Without metadata cache: ~100-200 Firebase reads per fetch cycle
-# - With metadata cache: ~1-5 Firebase reads per fetch cycle (99% reduction!)
+# - Without Firebase ID cache: ~5,000 Firebase reads per day
+# - With Firebase ID cache: ~5-50 Firebase reads per day (99% reduction!)
+# - Cache becomes effective immediately, not after 50 days
 # =============================================================================
 
 # SQLite-based disk cache for duplicate hash checks (minimal RAM usage)
@@ -75,6 +83,12 @@ CACHE_MAX_ENTRIES = 1000000  # 1 million entries (~120MB disk, excellent coverag
 CACHE_CLEANUP_THRESHOLD = 0.9  # Cleanup when 90% full (900k entries)
 cache_db_conn = None  # Database connection
 cache_db_lock = None  # Thread lock for database access
+
+# Firebase ID cache for existence checks (populated during fetching)
+FIREBASE_ID_CACHE_DB_FILE = "firebase_id_cache.db"  # Firebase ID cache database
+FIREBASE_ID_CACHE_MAX_ENTRIES = 500000  # 500k entries (simple ID list)
+firebase_id_cache_conn = None  # Firebase ID cache database connection
+firebase_id_cache_lock = None  # Thread lock for Firebase ID cache access
 
 # Metadata cache for wallpaper IDs (avoid Firebase reads during fetching)
 METADATA_CACHE_DB_FILE = "wallhaven_metadata_cache.db"  # Metadata cache database
@@ -339,6 +353,13 @@ async def maintenance_task():
                 cursor.execute('PRAGMA incremental_vacuum')
                 cache_db_conn.commit()
         
+        def optimize_firebase_id_db():
+            with firebase_id_cache_lock:
+                cursor = firebase_id_cache_conn.cursor()
+                cursor.execute('ANALYZE')
+                cursor.execute('PRAGMA incremental_vacuum')
+                firebase_id_cache_conn.commit()
+        
         def optimize_metadata_db():
             with metadata_cache_lock:
                 cursor = metadata_cache_conn.cursor()
@@ -347,6 +368,7 @@ async def maintenance_task():
                 metadata_cache_conn.commit()
         
         await loop.run_in_executor(None, optimize_hash_db)
+        await loop.run_in_executor(None, optimize_firebase_id_db)
         await loop.run_in_executor(None, optimize_metadata_db)
         
         logging.info("✓ Weekly maintenance completed")
@@ -372,8 +394,191 @@ def close_cache_db():
     except Exception as e:
         logging.error(f"Error closing cache database: {e}")
 
+def init_firebase_id_cache_db():
+    """Initialize Firebase ID cache database for fast ID existence checks"""
+    global firebase_id_cache_conn, firebase_id_cache_lock
+    
+    try:
+        firebase_id_cache_lock = threading.RLock()
+        firebase_id_cache_conn = sqlite3.connect(FIREBASE_ID_CACHE_DB_FILE, check_same_thread=False)
+        cursor = firebase_id_cache_conn.cursor()
+        
+        # Create simple table for wallpaper IDs (just IDs, no extra data)
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS firebase_ids (
+                wallpaper_id TEXT PRIMARY KEY,
+                added_at INTEGER NOT NULL
+            )
+        ''')
+        
+        # Optimize SQLite for stability
+        cursor.execute('PRAGMA journal_mode=DELETE')
+        cursor.execute('PRAGMA synchronous=FULL')
+        cursor.execute('PRAGMA cache_size=-2000')  # 2MB cache
+        cursor.execute('PRAGMA temp_store=MEMORY')
+        cursor.execute('PRAGMA page_size=4096')
+        cursor.execute('PRAGMA auto_vacuum=INCREMENTAL')
+        cursor.execute('PRAGMA incremental_vacuum(100)')
+        
+        firebase_id_cache_conn.commit()
+        
+        # Get cache statistics
+        cursor.execute('SELECT COUNT(*) FROM firebase_ids')
+        count = cursor.fetchone()[0]
+        
+        db_size_mb = os.path.getsize(FIREBASE_ID_CACHE_DB_FILE) / (1024 * 1024) if os.path.exists(FIREBASE_ID_CACHE_DB_FILE) else 0
+        
+        logging.info(f\"✓ Firebase ID cache initialized: {count:,} IDs, {db_size_mb:.1f}MB on disk\")
+        logging.info(f\"  Mode: Fast Firebase existence checks (max {FIREBASE_ID_CACHE_MAX_ENTRIES:,} entries)\")
+        
+    except Exception as e:
+        logging.error(f\"Failed to initialize Firebase ID cache: {e}\")
+        raise
+
+def check_firebase_id_cache(wallpaper_id):
+    """Check if wallpaper_id exists in Firebase ID cache"""
+    global firebase_id_cache_conn, firebase_id_cache_lock
+    
+    try:
+        with firebase_id_cache_lock:
+            cursor = firebase_id_cache_conn.cursor()
+            cursor.execute(
+                'SELECT wallpaper_id FROM firebase_ids WHERE wallpaper_id = ?',
+                (wallpaper_id,)
+            )
+            result = cursor.fetchone()
+            return result is not None
+    except Exception as e:
+        logging.error(f\"Error checking Firebase ID cache: {e}\")
+        return False  # On error, return False to check Firebase as fallback
+
+def add_to_firebase_id_cache(wallpaper_id):
+    """Add wallpaper ID to Firebase ID cache"""
+    global firebase_id_cache_conn, firebase_id_cache_lock
+    
+    try:
+        with firebase_id_cache_lock:
+            cursor = firebase_id_cache_conn.cursor()
+            cursor.execute(
+                '''INSERT OR REPLACE INTO firebase_ids (wallpaper_id, added_at) 
+                   VALUES (?, ?)''',
+                (wallpaper_id, int(time.time()))
+            )
+            firebase_id_cache_conn.commit()
+    except Exception as e:
+        logging.error(f\"Error adding to Firebase ID cache: {e}\")
+
+def cleanup_firebase_id_cache():
+    \"\"\"Clean up old Firebase ID cache entries when threshold is reached\"\"\"
+    global firebase_id_cache_conn, firebase_id_cache_lock
+    
+    try:
+        with firebase_id_cache_lock:
+            cursor = firebase_id_cache_conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM firebase_ids')
+            count = cursor.fetchone()[0]
+            
+            # Start cleanup when 90% full
+            cleanup_threshold = int(FIREBASE_ID_CACHE_MAX_ENTRIES * 0.9)
+            
+            if count > cleanup_threshold:
+                # Keep only 70% of max entries (remove oldest 30%)
+                target_size = int(FIREBASE_ID_CACHE_MAX_ENTRIES * 0.7)
+                entries_to_delete = count - target_size
+                
+                cursor.execute('''
+                    DELETE FROM firebase_ids 
+                    WHERE wallpaper_id IN (
+                        SELECT wallpaper_id FROM firebase_ids 
+                        ORDER BY added_at ASC 
+                        LIMIT ?
+                    )
+                ''', (entries_to_delete,))
+                
+                firebase_id_cache_conn.commit()
+                cursor.execute('PRAGMA incremental_vacuum')
+                
+                logging.info(f\"Cleaned up {entries_to_delete:,} old Firebase ID cache entries\")
+                
+    except Exception as e:
+        logging.error(f\"Error cleaning up Firebase ID cache: {e}\")
+
+async def sync_firebase_id_cache_from_firebase(wallpaper_collection):
+    \"\"\"Sync Firebase ID cache from Firebase (run on startup if cache is empty)\"\"\"
+    global firebase_id_cache_conn, firebase_id_cache_lock
+    
+    try:
+        logging.info(\"Syncing Firebase ID cache from Firebase...\")
+        
+        # Check if cache is empty
+        with firebase_id_cache_lock:
+            cursor = firebase_id_cache_conn.cursor()
+            cursor.execute('SELECT COUNT(*) FROM firebase_ids')
+            cache_count = cursor.fetchone()[0]
+        
+        if cache_count > 0:
+            logging.info(f\"  Firebase ID cache has {cache_count:,} entries, skipping full sync\")
+            return
+        
+        # Cache is empty - rebuild from Firebase (sync ALL wallpapers)
+        logging.info(\"  Cache is empty, rebuilding from Firebase...\")
+        
+        loop = asyncio.get_event_loop()
+        
+        # Fetch ALL wallpaper IDs from Firebase (just IDs, no other data)
+        def fetch_all_ids():
+            docs = wallpaper_collection.select(['wallpaper_id']).stream()
+            id_list = []
+            for doc in docs:
+                data = doc.to_dict()
+                wallpaper_id = data.get('wallpaper_id', doc.id)
+                id_list.append((wallpaper_id, int(time.time())))
+            return id_list
+        
+        id_list = await loop.run_in_executor(None, fetch_all_ids)
+        
+        if not id_list:
+            logging.info(\"  No wallpapers found in Firebase, cache remains empty\")
+            return
+        
+        # Batch insert into cache
+        def batch_insert(id_list):
+            with firebase_id_cache_lock:
+                cursor = firebase_id_cache_conn.cursor()
+                cursor.executemany(
+                    '''INSERT OR REPLACE INTO firebase_ids (wallpaper_id, added_at) 
+                       VALUES (?, ?)''',
+                    id_list
+                )
+                firebase_id_cache_conn.commit()
+        
+        await loop.run_in_executor(None, batch_insert, id_list)
+        
+        db_size_mb = os.path.getsize(FIREBASE_ID_CACHE_DB_FILE) / (1024 * 1024)
+        logging.info(f\"✓ Synced {len(id_list):,} wallpaper IDs from Firebase ({db_size_mb:.1f}MB)\")
+        
+    except Exception as e:
+        logging.error(f\"Failed to sync Firebase ID cache from Firebase: {e}\")
+        logging.error(\"Bot will continue but may have higher Firebase read costs\")
+
+def close_firebase_id_cache_db():
+    \"\"\"Close Firebase ID cache database connection\"\"\"
+    global firebase_id_cache_conn
+    
+    try:
+        if firebase_id_cache_conn:
+            cursor = firebase_id_cache_conn.cursor()
+            logging.info(\"Optimizing Firebase ID cache before shutdown...\")
+            cursor.execute('ANALYZE')
+            cursor.execute('PRAGMA incremental_vacuum')
+            firebase_id_cache_conn.commit()
+            firebase_id_cache_conn.close()
+            logging.info(\"✓ Firebase ID cache closed and optimized\")
+    except Exception as e:
+        logging.error(f\"Error closing Firebase ID cache: {e}\")
+
 def init_metadata_cache_db():
-    """Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)"""
+    \"\"\"Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)\"\"\"
     global metadata_cache_conn, metadata_cache_lock
     
     try:
@@ -722,6 +927,7 @@ def handle_shutdown():
     shutdown_requested = True
     logging.info("Shutdown requested. Closing cache databases and waiting for ongoing tasks to complete...")
     close_cache_db()  # Close hash cache database
+    close_firebase_id_cache_db()  # Close Firebase ID cache database
     close_metadata_cache_db()  # Close metadata cache database
 
 async def enforce_rate_limit():
@@ -2120,8 +2326,11 @@ async def main():
     logging.info("Initializing cache databases...")
     init_cache_db()  # SHA256 hash cache for duplicate detection
     
+    logging.info("Initializing Firebase ID cache...")
+    init_firebase_id_cache_db()  # Firebase ID cache for fast existence checks
+    
     logging.info("Initializing metadata cache...")
-    init_metadata_cache_db()  # Wallpaper ID cache to avoid Firebase reads
+    init_metadata_cache_db()  # Metadata cache for processed wallpaper tracking
     
     # Connect to Firebase
     logging.info("")
@@ -2129,6 +2338,9 @@ async def main():
     db = connect_to_firebase(firebase_cred_path)
     wallpaper_collection = db.collection('wallhaven')
     state_collection = db.collection('fetch_state')
+    
+    # Sync Firebase ID cache from Firebase (handles fresh deployment/crash recovery)
+    await sync_firebase_id_cache_from_firebase(wallpaper_collection)
     
     # Sync metadata cache from Firebase (handles fresh deployment/crash recovery)
     await sync_metadata_cache_from_firebase(wallpaper_collection)
