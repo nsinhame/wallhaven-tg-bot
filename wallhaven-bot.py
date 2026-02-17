@@ -1436,6 +1436,73 @@ def _create_thumbnail_sync(image_path, thumb_path, max_size_kb):
         logging.error(f"Error in _create_thumbnail_sync: {e}")
         raise
 
+async def create_compressed_preview(image_path, max_size_mb=9.0):
+    """Create compressed preview for Telegram photo upload (max 10MB limit)"""
+    try:
+        base, ext = os.path.splitext(image_path)
+        preview_path = base + '_preview.jpg'
+        
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, _create_compressed_preview_sync, image_path, preview_path, max_size_mb)
+        
+        if os.path.exists(preview_path):
+            size_mb = os.path.getsize(preview_path) / (1024 * 1024)
+            if size_mb <= max_size_mb:
+                return preview_path
+            else:
+                logging.error(f"Compressed preview still too large: {size_mb:.2f}MB")
+                os.remove(preview_path)
+                return None
+        return None
+    except Exception as e:
+        logging.error(f"Error creating compressed preview: {e}")
+        return None
+
+def _create_compressed_preview_sync(image_path, preview_path, max_size_mb):
+    """Synchronous compressed preview creation"""
+    try:
+        max_size_bytes = max_size_mb * 1024 * 1024
+        
+        with Image.open(image_path) as img:
+            # Convert to RGB if needed
+            if img.mode in ('RGBA', 'LA', 'P'):
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+            
+            # Start with high quality and reduce if needed
+            quality = 85
+            
+            # Try progressively lower quality and smaller dimensions
+            for scale_factor in [1.0, 0.9, 0.8, 0.7]:
+                if scale_factor < 1.0:
+                    # Resize image
+                    new_width = int(img.width * scale_factor)
+                    new_height = int(img.height * scale_factor)
+                    resized = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                else:
+                    resized = img
+                
+                # Try different quality levels at this scale
+                for q in range(quality, 19, -10):
+                    resized.save(preview_path, 'JPEG', quality=q, optimize=True)
+                    size_bytes = os.path.getsize(preview_path)
+                    
+                    if size_bytes <= max_size_bytes:
+                        return  # Success!
+            
+            # If still too large, create very aggressive compression
+            resized = img.resize((int(img.width * 0.5), int(img.height * 0.5)), Image.Resampling.LANCZOS)
+            resized.save(preview_path, 'JPEG', quality=20, optimize=True)
+            
+    except Exception as e:
+        logging.error(f"Error in _create_compressed_preview_sync: {e}")
+        raise
+
 async def generate_thumbnail_legacy(image_path, max_size_kb=200):
     """Legacy ImageMagick thumbnail generation (fallback)"""
     try:
@@ -1715,13 +1782,22 @@ def telegram_send_media_group(chat_id, media_list, is_document=False):
         files_dict = {}
         
         for idx, item in enumerate(media_list):
-            if not os.path.exists(item['path']):
-                logging.error(f"File not found: {item['path']}")
+            # For photos, use preview_path (compressed if file was large)
+            # For documents, use original path
+            file_path = item.get('preview_path', item['path']) if not is_document else item['path']
+            
+            # Skip if preview_path is None (compression failed for large file)
+            if not is_document and not file_path:
+                logging.warning(f"Skipping photo upload for {item.get('wallpaper_id')} - no preview available")
+                continue
+            
+            if not os.path.exists(file_path):
+                logging.error(f"File not found: {file_path}")
                 continue
             
             # Open files and track them
             file_key = f"file{idx}"
-            file_obj = open(item['path'], 'rb')
+            file_obj = open(file_path, 'rb')
             opened_files.append(file_obj)
             files_dict[file_key] = file_obj
             
@@ -1837,11 +1913,23 @@ async def send_wallpaper_to_group(collection, category, group_id):
             
             file_size_mb = os.path.getsize(path) / (1024 * 1024)
             thumbnail_path = None
+            preview_path = path  # Default: use original file for preview
             
-            # Only generate thumbnail for HD document if file > 9MB
-            # Preview photos will be sent without thumbnail (Telegram auto-compresses)
-            if file_size_mb > 9.0:
-                logging.info(f"[{category}] File size {file_size_mb:.2f}MB > 9.0MB, generating thumbnail for HD document...")
+            # Telegram photo limit is 10MB - if file is larger, create compressed preview
+            if file_size_mb > 9.5:  # Use 9.5MB threshold for safety margin
+                logging.info(f"[{category}] File size {file_size_mb:.2f}MB > 9.5MB, creating compressed preview...")
+                
+                # Create compressed preview for Telegram photo (max 9MB)
+                preview_path = await create_compressed_preview(path, max_size_mb=9.0)
+                if preview_path:
+                    downloaded_files.append(preview_path)
+                    preview_size_mb = os.path.getsize(preview_path) / (1024 * 1024)
+                    logging.info(f"[{category}] Created compressed preview: {preview_size_mb:.2f}MB")
+                else:
+                    logging.warning(f"[{category}] Failed to create compressed preview, will skip photo upload")
+                    preview_path = None  # Skip preview if compression failed
+                
+                # Also generate thumbnail for HD document
                 thumbnail_path = await generate_thumbnail(path, max_size_kb=150)
                 if thumbnail_path:
                     downloaded_files.append(thumbnail_path)
@@ -1874,7 +1962,8 @@ async def send_wallpaper_to_group(collection, category, group_id):
             
             wallpaper_data.append({
                 'wallpaper_id': wallpaper_id,
-                'path': path,
+                'path': path,  # Original HD file
+                'preview_path': preview_path,  # Compressed preview (or original if <9.5MB)
                 'thumbnail': thumbnail_path,
                 'sha256': sha256,
                 'tags': tags,
@@ -1888,10 +1977,17 @@ async def send_wallpaper_to_group(collection, category, group_id):
         logging.info(f"[{category}] Sending {len(wallpaper_data)} wallpapers to Telegram...")
         
         try:
-            # Send preview photos (Telegram will auto-compress, we don't need thumbnails)
-            preview_responses = telegram_send_media_group(group_id, wallpaper_data, is_document=False)
-            if not preview_responses:
-                raise Exception("Failed to send preview images")
+            # Send preview photos (compressed versions for files >9.5MB)
+            # Some wallpapers might not have previews if compression failed
+            preview_responses = None
+            wallpapers_with_preview = [w for w in wallpaper_data if w.get('preview_path')]
+            
+            if wallpapers_with_preview:
+                preview_responses = telegram_send_media_group(group_id, wallpaper_data, is_document=False)
+                if not preview_responses:
+                    logging.warning(f"[{category}] Failed to send preview images, will only send HD documents")
+            else:
+                logging.info(f"[{category}] No preview images available (all files too large), sending HD documents only")
             
             await asyncio.sleep(3)
             
@@ -1906,10 +2002,14 @@ async def send_wallpaper_to_group(collection, category, group_id):
                 hd_responses_map[item['wallpaper_id']] = response
                 await asyncio.sleep(0.5)
             
-            # Update database - only mark as posted if both uploads succeeded
-            preview_result_list = preview_responses.get('result', [])
+            # Update database - only mark as posted if HD upload succeeded (preview is optional)
+            preview_result_list = preview_responses.get('result', []) if preview_responses else []
+            
             for i, item in enumerate(wallpaper_data):
-                preview_msg = preview_result_list[i] if i < len(preview_result_list) else {}
+                # Preview might not exist for this wallpaper (if too large or compression failed)
+                preview_msg = {}
+                if item.get('preview_path') and i < len(preview_result_list):
+                    preview_msg = preview_result_list[i]
                 
                 # Get HD response for this specific wallpaper
                 hd_response = hd_responses_map.get(item['wallpaper_id'])
@@ -1918,7 +2018,7 @@ async def send_wallpaper_to_group(collection, category, group_id):
                 else:
                     hd_result = {}
                 
-                # Check if both preview and HD were successful
+                # Check if uploads were successful
                 preview_success = bool(preview_msg.get('message_id'))
                 hd_success = bool(hd_result.get('message_id'))
                 
@@ -1926,7 +2026,8 @@ async def send_wallpaper_to_group(collection, category, group_id):
                     "preview": {
                         "message_id": preview_msg.get('message_id'),
                         "date": preview_msg.get('date'),
-                        "success": preview_success
+                        "success": preview_success,
+                        "skipped": not item.get('preview_path')  # Track if preview was skipped
                     },
                     "hd": {
                         "message_id": hd_result.get('message_id'),
@@ -1938,15 +2039,16 @@ async def send_wallpaper_to_group(collection, category, group_id):
                     "album_size": len(wallpaper_data)
                 }
                 
-                if preview_success and hd_success:
+                # Mark as posted if HD upload succeeded (preview is optional)
+                if hd_success:
                     update_wallpaper_status(collection, item['wallpaper_id'], "posted", item['sha256'], tg_response=tg_response)
-                    logging.info(f"[{category}] ✓ Posted {item['wallpaper_id']} to group {group_id} (album {i+1}/{len(wallpaper_data)})")
+                    preview_status = "✓" if preview_success else "⊘"
+                    logging.info(f"[{category}] ✓ Posted {item['wallpaper_id']} to group {group_id} (preview:{preview_status}, HD:✓, album {i+1}/{len(wallpaper_data)})")
                 else:
-                    # Mark as failed if either upload didn't complete
-                    failed_part = "preview" if not preview_success else "HD"
-                    tg_response["failure_reason"] = f"{failed_part} upload failed"
+                    # Mark as failed if HD upload didn't complete
+                    tg_response["failure_reason"] = "HD upload failed"
                     update_wallpaper_status(collection, item['wallpaper_id'], "failed", item['sha256'], tg_response=tg_response)
-                    logging.error(f"[{category}] ✗ Failed to post {item['wallpaper_id']}: {failed_part} upload failed")
+                    logging.error(f"[{category}] ✗ Failed to post {item['wallpaper_id']}: HD upload failed")
             
         except Exception as telegram_e:
             logging.error(f"[{category}] Telegram upload failed: {telegram_e}")
