@@ -1235,7 +1235,6 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
     added = 0
     duplicates = 0
     errors = 0
-    processed = 0
     results_per_page = 24  # Track for better pagination (FIX #8)
     
     # Calculate starting page based on skip_count (using ceiling division)
@@ -1257,9 +1256,8 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
     loop = asyncio.get_event_loop()
     
     no_more_results = False
-    # Allow some over-fetching if many duplicates, but cap it (FIX #5)
-    max_processed = target_count * 2
-    while added < target_count and processed < max_processed and not shutdown_requested and not no_more_results:
+    pages_fetched = 0  # Track for logging purposes
+    while added < target_count and not shutdown_requested and not no_more_results:
         params["page"] = page
         await enforce_rate_limit()
         
@@ -1289,8 +1287,6 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                     if not check_rate_limit():
                         logging.info(f"\n🛑 Rate limit reached. Stopping fetch for {category}:{search_term}")
                     break
-                
-                processed += 1
                 
                 wallpaper_id = wallpaper.get("id", "")
                 wallpaper_url = wallpaper.get("url", "")
@@ -1385,6 +1381,7 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 break
             
             page += 1
+            pages_fetched += 1
             
         except requests.exceptions.RequestException as e:
             logging.error(f"Error fetching search results: {e}")
@@ -1392,7 +1389,7 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 logging.error("Invalid API key!")
             break
     
-    logging.info(f"✓ Complete: {added} added, {duplicates} duplicates, {errors} errors")
+    logging.info(f"✓ Complete: {added} added, {duplicates} duplicates, {errors} errors ({pages_fetched} pages checked)")
     logging.info("")
     
     # Update state for next round if we reached target
