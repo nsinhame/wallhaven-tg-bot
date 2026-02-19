@@ -403,20 +403,26 @@ def close_cache_db():
     """Close cache database connection with cleanup"""
     global cache_db_conn
     
+    if cache_db_conn is None:
+        return  # Already closed
+    
     try:
-        if cache_db_conn:
-            cursor = cache_db_conn.cursor()
-            
-            # Final optimization before closing
-            logging.info("Optimizing cache database before shutdown...")
-            cursor.execute('ANALYZE')  # Update statistics
-            cursor.execute('PRAGMA incremental_vacuum')  # Reclaim space
-            
-            cache_db_conn.commit()
-            cache_db_conn.close()
-            logging.info("✓ Cache database closed and optimized")
+        cursor = cache_db_conn.cursor()
+        
+        # Final optimization before closing
+        logging.info("Optimizing cache database before shutdown...")
+        cursor.execute('ANALYZE')  # Update statistics
+        cursor.execute('PRAGMA incremental_vacuum')  # Reclaim space
+        
+        cache_db_conn.commit()
+        cache_db_conn.close()
+        cache_db_conn = None  # Mark as closed
+        logging.info("✓ Cache database closed and optimized")
     except Exception as e:
-        logging.error(f"Error closing cache database: {e}")
+        # Suppress 'closed database' errors (already closed)
+        if "closed database" not in str(e).lower():
+            logging.error(f"Error closing cache database: {e}")
+        cache_db_conn = None  # Mark as closed even on error
 
 def init_firebase_id_cache_db():
     """Initialize Firebase ID cache database for fast ID existence checks"""
@@ -589,17 +595,23 @@ def close_firebase_id_cache_db():
     """Close Firebase ID cache database connection"""
     global firebase_id_cache_conn
     
+    if firebase_id_cache_conn is None:
+        return  # Already closed
+    
     try:
-        if firebase_id_cache_conn:
-            cursor = firebase_id_cache_conn.cursor()
-            logging.info("Optimizing Firebase ID cache before shutdown...")
-            cursor.execute('ANALYZE')
-            cursor.execute('PRAGMA incremental_vacuum')
-            firebase_id_cache_conn.commit()
-            firebase_id_cache_conn.close()
-            logging.info("✓ Firebase ID cache closed and optimized")
+        cursor = firebase_id_cache_conn.cursor()
+        logging.info("Optimizing Firebase ID cache before shutdown...")
+        cursor.execute('ANALYZE')
+        cursor.execute('PRAGMA incremental_vacuum')
+        firebase_id_cache_conn.commit()
+        firebase_id_cache_conn.close()
+        firebase_id_cache_conn = None  # Mark as closed
+        logging.info("✓ Firebase ID cache closed and optimized")
     except Exception as e:
-        logging.error(f"Error closing Firebase ID cache: {e}")
+        # Suppress 'closed database' errors (already closed)
+        if "closed database" not in str(e).lower():
+            logging.error(f"Error closing Firebase ID cache: {e}")
+        firebase_id_cache_conn = None  # Mark as closed even on error
 
 def init_metadata_cache_db():
     """Initialize metadata cache database for wallpaper IDs (avoids Firebase reads)"""
@@ -812,17 +824,23 @@ def close_metadata_cache_db():
     """Close metadata cache database connection"""
     global metadata_cache_conn
     
+    if metadata_cache_conn is None:
+        return  # Already closed
+    
     try:
-        if metadata_cache_conn:
-            cursor = metadata_cache_conn.cursor()
-            logging.info("Optimizing metadata cache before shutdown...")
-            cursor.execute('ANALYZE')
-            cursor.execute('PRAGMA incremental_vacuum')
-            metadata_cache_conn.commit()
-            metadata_cache_conn.close()
-            logging.info("✓ Metadata cache closed and optimized")
+        cursor = metadata_cache_conn.cursor()
+        logging.info("Optimizing metadata cache before shutdown...")
+        cursor.execute('ANALYZE')
+        cursor.execute('PRAGMA incremental_vacuum')
+        metadata_cache_conn.commit()
+        metadata_cache_conn.close()
+        metadata_cache_conn = None  # Mark as closed
+        logging.info("✓ Metadata cache closed and optimized")
     except Exception as e:
-        logging.error(f"Error closing metadata cache: {e}")
+        # Suppress 'closed database' errors (already closed)
+        if "closed database" not in str(e).lower():
+            logging.error(f"Error closing metadata cache: {e}")
+        metadata_cache_conn = None  # Mark as closed even on error
 
 def load_rate_limit_state():
     """Load rate limiting state from database"""
@@ -965,12 +983,30 @@ def increment_wallpaper_count():
         logging.info(f"  Fetching will pause. Resumes in {time_left_hours:.1f} hours. Posting continues.")
 
 def handle_shutdown():
+    """Handle shutdown signal - close databases and set shutdown flag"""
     global shutdown_requested
+    
+    # Make this idempotent - only run once
+    if shutdown_requested:
+        return
+    
     shutdown_requested = True
     logging.info("Shutdown requested. Closing cache databases and waiting for ongoing tasks to complete...")
-    close_cache_db()  # Close hash cache database
-    close_firebase_id_cache_db()  # Close Firebase ID cache database
-    close_metadata_cache_db()  # Close metadata cache database
+    
+    try:
+        close_cache_db()  # Close hash cache database
+    except:
+        pass  # Already closed
+    
+    try:
+        close_firebase_id_cache_db()  # Close Firebase ID cache database
+    except:
+        pass  # Already closed
+    
+    try:
+        close_metadata_cache_db()  # Close metadata cache database
+    except:
+        pass  # Already closed
 
 async def enforce_rate_limit():
     """Enforce Wallhaven API rate limit of 40 requests per minute"""
@@ -1477,8 +1513,13 @@ async def wallpaper_fetcher_task(db, api_key, categories):
             logging.info(f"⏸ Fetcher paused - rate limit reached ({rate_limit_state['wallpapers_added']}/{MAX_WALLPAPERS_PER_PERIOD})")
             logging.info(f"  Will resume in {time_left_hours:.1f} hours. Sleeping for 1 hour, then checking again...")
             
-            # Sleep for 1 hour and check again (in case bot restarted or period expired)
-            await asyncio.sleep(3600)  # 1 hour
+            # Sleep for 1 hour in small chunks so shutdown can interrupt
+            # Break into 60 chunks of 1 minute each (60 * 60s = 3600s = 1 hour)
+            for _ in range(60):
+                if shutdown_requested:
+                    logging.info("Fetcher received shutdown signal during sleep")
+                    break
+                await asyncio.sleep(60)  # 1 minute chunks
             continue
         
         # Get resume position for fair distribution
@@ -2388,14 +2429,20 @@ async def main():
     else:
         logging.info(f"✓ Using existing cache directory: {cache_dir}")
     
-    # Signal handling
+    # Signal handling for graceful shutdown
+    def signal_handler(sig, frame):
+        """Handle Ctrl+C and other signals"""
+        handle_shutdown()
+    
     if sys.platform != 'win32':
+        # Unix-like systems - use asyncio signal handlers
         loop = asyncio.get_running_loop()
         loop.add_signal_handler(signal.SIGINT, handle_shutdown)
         loop.add_signal_handler(signal.SIGTERM, handle_shutdown)
     else:
-        # Windows only supports SIGINT (Ctrl+C), not SIGTERM
-        signal.signal(signal.SIGINT, lambda sig, frame: handle_shutdown())
+        # Windows - use signal.signal (SIGINT only)
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
     
     # Load configuration
     firebase_cred_path = load_firebase_config()
@@ -2517,16 +2564,24 @@ async def main():
     while not shutdown_requested:
         await asyncio.sleep(1)
     
-    # Graceful shutdown
+    # Graceful shutdown with timeout
     if ACTIVE_TASKS:
-        logging.info(f"Waiting for {len(ACTIVE_TASKS)} active tasks to finish...")
-        await asyncio.gather(*ACTIVE_TASKS, return_exceptions=True)
+        logging.info(f"Waiting for {len(ACTIVE_TASKS)} active tasks to finish (10s timeout)...")
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*ACTIVE_TASKS, return_exceptions=True),
+                timeout=10.0  # 10 second timeout
+            )
+            logging.info("✓ All tasks completed successfully")
+        except asyncio.TimeoutError:
+            logging.warning("⏱ Timeout reached, forcing shutdown...")
     
     scheduler.shutdown()
     
-    # Close cache database
-    logging.info("Closing cache database...")
+    # Close all cache databases (in case not already closed by signal handler)
     close_cache_db()
+    close_firebase_id_cache_db()
+    close_metadata_cache_db()
     
     logging.info("=" * 70)
     logging.info("Bot stopped gracefully. All tasks completed.")
