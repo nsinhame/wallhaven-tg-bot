@@ -1361,8 +1361,8 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 retry_delay = 5
                 added_flag = False
                 
-                # Check metadata cache first to avoid Firebase read
-                if check_metadata_cache(wallpaper_id):
+                # Check Firebase ID cache first to avoid Firebase read (contains ALL wallpaper IDs)
+                if check_firebase_id_cache(wallpaper_id):
                     duplicates += 1
                     if duplicates % 20 == 0:
                         logging.info(f"  [{added}/{target_count}] ⊘ {duplicates} duplicates (cached)...")
@@ -1374,6 +1374,8 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                         existing = wallpaper_collection.document(wallpaper_id).get()
                         if existing.exists:
                             duplicates += 1
+                            # Update Firebase ID cache for next time
+                            add_to_firebase_id_cache(wallpaper_id)
                             # Don't add to metadata cache during fetching - only during posting!
                             # This allows fetched wallpapers to be posted to Telegram
                             if duplicates % 20 == 0:
@@ -1381,6 +1383,8 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                         else:
                             wallpaper_collection.document(wallpaper_id).set(document)
                             added += 1
+                            # Update Firebase ID cache immediately after adding to Firebase
+                            add_to_firebase_id_cache(wallpaper_id)
                             # Don't add to metadata cache during fetching!
                             # Metadata cache should only contain posted/skipped/failed wallpapers
                             # This is the key fix to allow newly fetched wallpapers to be posted
