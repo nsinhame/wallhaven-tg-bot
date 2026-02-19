@@ -102,7 +102,9 @@ RATE_LIMIT_PERIOD_HOURS = 28  # Period duration in hours
 rate_limit_state = {  # Global rate limit state
     'period_start': 0,
     'wallpapers_added': 0,
-    'is_paused': False
+    'is_paused': False,
+    'last_category': '',  # Resume position - category
+    'last_search_term': ''  # Resume position - search term
 }
 
 FIRESTORE_QUOTA_BACKOFF = 60  # seconds to wait after quota error
@@ -178,9 +180,22 @@ def init_cache_db():
                 id INTEGER PRIMARY KEY CHECK (id = 1),
                 period_start INTEGER NOT NULL,
                 wallpapers_added INTEGER NOT NULL,
-                last_updated INTEGER NOT NULL
+                last_updated INTEGER NOT NULL,
+                last_category TEXT DEFAULT '',
+                last_search_term TEXT DEFAULT ''
             )
         ''')
+        
+        # Migrate existing database: add resume position columns if they don't exist
+        try:
+            cursor.execute("SELECT last_category FROM rate_limit_state LIMIT 1")
+        except sqlite3.OperationalError:
+            # Columns don't exist - add them
+            logging.info("  Migrating rate_limit_state table: adding resume position columns...")
+            cursor.execute("ALTER TABLE rate_limit_state ADD COLUMN last_category TEXT DEFAULT ''")
+            cursor.execute("ALTER TABLE rate_limit_state ADD COLUMN last_search_term TEXT DEFAULT ''")
+            cache_db_conn.commit()
+            logging.info("  ✓ Database migration completed")
         
         # Optimize SQLite for stability and minimal resource usage (not performance)
         cursor.execute('PRAGMA journal_mode=DELETE')  # More stable than WAL, less disk usage
@@ -807,27 +822,34 @@ def load_rate_limit_state():
     try:
         with cache_db_lock:
             cursor = cache_db_conn.cursor()
-            cursor.execute('SELECT period_start, wallpapers_added FROM rate_limit_state WHERE id = 1')
+            cursor.execute('SELECT period_start, wallpapers_added, last_category, last_search_term FROM rate_limit_state WHERE id = 1')
             result = cursor.fetchone()
             
             if result:
-                period_start, wallpapers_added = result
+                period_start, wallpapers_added, last_category, last_search_term = result
                 current_time = int(time.time())
                 period_duration_seconds = RATE_LIMIT_PERIOD_HOURS * 3600
                 
                 # Check if period has expired
                 if current_time - period_start >= period_duration_seconds:
-                    # Start new period
+                    # Start new period (keep resume position for fair distribution)
                     rate_limit_state['period_start'] = current_time
                     rate_limit_state['wallpapers_added'] = 0
                     rate_limit_state['is_paused'] = False
+                    rate_limit_state['last_category'] = last_category or ''
+                    rate_limit_state['last_search_term'] = last_search_term or ''
                     save_rate_limit_state()
-                    logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
+                    if last_category and last_search_term:
+                        logging.info(f"✓ New period started - will resume from {last_category}:{last_search_term}")
+                    else:
+                        logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
                 else:
                     # Continue existing period
                     rate_limit_state['period_start'] = period_start
                     rate_limit_state['wallpapers_added'] = wallpapers_added
                     rate_limit_state['is_paused'] = wallpapers_added >= MAX_WALLPAPERS_PER_PERIOD
+                    rate_limit_state['last_category'] = last_category or ''
+                    rate_limit_state['last_search_term'] = last_search_term or ''
                     
                     remaining = MAX_WALLPAPERS_PER_PERIOD - wallpapers_added
                     time_left_hours = (period_start + period_duration_seconds - current_time) / 3600
@@ -844,6 +866,8 @@ def load_rate_limit_state():
                 rate_limit_state['period_start'] = current_time
                 rate_limit_state['wallpapers_added'] = 0
                 rate_limit_state['is_paused'] = False
+                rate_limit_state['last_category'] = ''
+                rate_limit_state['last_search_term'] = ''
                 save_rate_limit_state()
                 logging.info(f"✓ Rate limit initialized (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
                 
@@ -853,6 +877,8 @@ def load_rate_limit_state():
         rate_limit_state['period_start'] = int(time.time())
         rate_limit_state['wallpapers_added'] = 0
         rate_limit_state['is_paused'] = False
+        rate_limit_state['last_category'] = ''
+        rate_limit_state['last_search_term'] = ''
 
 def save_rate_limit_state():
     """Save rate limiting state to database"""
@@ -862,12 +888,14 @@ def save_rate_limit_state():
         with cache_db_lock:
             cursor = cache_db_conn.cursor()
             cursor.execute('''
-                INSERT OR REPLACE INTO rate_limit_state (id, period_start, wallpapers_added, last_updated)
-                VALUES (1, ?, ?, ?)
+                INSERT OR REPLACE INTO rate_limit_state (id, period_start, wallpapers_added, last_updated, last_category, last_search_term)
+                VALUES (1, ?, ?, ?, ?, ?)
             ''', (
                 rate_limit_state['period_start'],
                 rate_limit_state['wallpapers_added'],
-                int(time.time())
+                int(time.time()),
+                rate_limit_state.get('last_category', ''),
+                rate_limit_state.get('last_search_term', '')
             ))
             cache_db_conn.commit()
     except Exception as e:
@@ -882,12 +910,17 @@ def check_rate_limit():
     
     # Check if period has expired
     if current_time - rate_limit_state['period_start'] >= period_duration_seconds:
-        # Start new period
+        # Start new period (keep resume position)
+        last_cat = rate_limit_state.get('last_category', '')
+        last_term = rate_limit_state.get('last_search_term', '')
         rate_limit_state['period_start'] = current_time
         rate_limit_state['wallpapers_added'] = 0
         rate_limit_state['is_paused'] = False
         save_rate_limit_state()
-        logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
+        if last_cat and last_term:
+            logging.info(f"✓ New period started - will resume from {last_cat}:{last_term}")
+        else:
+            logging.info(f"✓ New rate limit period started (limit: {MAX_WALLPAPERS_PER_PERIOD} wallpapers per {RATE_LIMIT_PERIOD_HOURS}h)")
         return True
     
     # Check if limit reached
@@ -1272,12 +1305,17 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
                 break
             
             wallpapers = data.get("data", [])
+            meta = data.get("meta", {})
+            current_page = meta.get("current_page", page)
+            last_page = meta.get("last_page", page)
+            
             if wallpapers and isinstance(wallpapers, list):
                 # Update results_per_page based on actual API response
                 results_per_page = len(wallpapers)
             
-            if not wallpapers:
-                logging.info(f"No more wallpapers found (page {page})")
+            # Check if we've reached the end using meta pagination or empty data
+            if not wallpapers or current_page >= last_page:
+                logging.info(f"No more wallpapers (page {current_page}/{last_page})")
                 no_more_results = True
                 break
             
@@ -1430,6 +1468,15 @@ async def wallpaper_fetcher_task(db, api_key, categories):
             await asyncio.sleep(3600)  # 1 hour
             continue
         
+        # Get resume position for fair distribution
+        resume_category = rate_limit_state.get('last_category', '')
+        resume_search_term = rate_limit_state.get('last_search_term', '')
+        started_processing = False
+        
+        # If we have a resume position, log it
+        if resume_category and resume_search_term:
+            logging.info(f"📍 Resuming from saved position: {resume_category} → {resume_search_term}")
+        
         for category_config in categories:
             if shutdown_requested:
                 break
@@ -1438,8 +1485,22 @@ async def wallpaper_fetcher_task(db, api_key, categories):
             search_terms = category_config['search_terms']
             
             for search_term in search_terms:
+                # Skip until we reach resume position (if set)
+                if resume_category and resume_search_term and not started_processing:
+                    if category == resume_category and search_term == resume_search_term:
+                        started_processing = True
+                        logging.info(f"✓ Found resume position, starting from here")
+                    else:
+                        continue  # Skip this one, not at resume position yet
+                elif not resume_category or not resume_search_term:
+                    started_processing = True  # No resume position, start from beginning
                 if shutdown_requested:
                     break
+                
+                # Save current position before fetching (for resume on rate limit)
+                rate_limit_state['last_category'] = category
+                rate_limit_state['last_search_term'] = search_term
+                save_rate_limit_state()
                 
                 try:
                     await fetch_wallpapers_for_term(
@@ -1453,15 +1514,28 @@ async def wallpaper_fetcher_task(db, api_key, categories):
                     logging.error(f"Error fetching wallpapers for {category}:{search_term}: {e}")
                     logging.error("Continuing with next search term...")
                 
+                # Check if rate limit hit during this fetch
+                if not check_rate_limit():
+                    logging.info(f"💾 Saved position: {category}:{search_term} - will resume here after rate limit expires")
+                    break
+                
                 # Small delay between search terms
                 await asyncio.sleep(2)
+            
+            # Break out of category loop if rate limit hit
+            if not check_rate_limit():
+                break
             
             # Delay between categories
             await asyncio.sleep(5)
         
-        if not shutdown_requested:
+        if not shutdown_requested and check_rate_limit():
+            # Completed full cycle - reset resume position to start from beginning next time
             logging.info("✓ Completed full cycle through all categories")
-            logging.info("🔄 Starting next round...")
+            rate_limit_state['last_category'] = ''
+            rate_limit_state['last_search_term'] = ''
+            save_rate_limit_state()
+            logging.info("🔄 Starting next round from beginning...")
             await asyncio.sleep(10)
     
     logging.info("🔄 Wallpaper fetcher task stopped")
