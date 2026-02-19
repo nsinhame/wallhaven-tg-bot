@@ -30,6 +30,15 @@ from firebase_admin import credentials, firestore
 from google.cloud.firestore_v1.base_query import FieldFilter
 from google.api_core.exceptions import ResourceExhausted, RetryError
 from PIL import Image
+import warnings
+
+# Configure PIL to handle large images (we validate dimensions separately)
+# Default is ~89MP, increase to 150MP to avoid decompression bomb warnings
+# This is safe because we validate dimensions before processing
+Image.MAX_IMAGE_PIXELS = 150000000  # 150 megapixels
+
+# Suppress PIL decompression bomb warnings (we handle size validation ourselves)
+warnings.filterwarnings('ignore', category=Image.DecompressionBombWarning)
 
 # Load environment variables from .env file
 load_dotenv()
@@ -1646,20 +1655,28 @@ def validate_image_dimensions(image_path):
     try:
         with Image.open(image_path) as img:
             width, height = img.size
+            
             # Telegram photo requirements:
             # - Sum of width and height must not exceed 10000
             # - Aspect ratio must be reasonable (not too extreme)
-            if width + height > 10000:
-                logging.warning(f"Image dimensions too large: {width}x{height}")
-                return False
+            
+            # Check for basic validity
             if width < 1 or height < 1:
-                logging.warning(f"Invalid image dimensions: {width}x{height}")
+                logging.warning(f"Invalid image dimensions: {width}x{height} (must be positive)")
                 return False
+            
+            # Check Telegram limit (width + height <= 10000)
+            if width + height > 10000:
+                logging.warning(f"Image dimensions exceed Telegram limit: {width}x{height} (sum={width+height} > 10000)")
+                logging.info(f"  Image size: {width*height:,} pixels ({(width*height)/1000000:.1f}MP)")
+                return False
+            
             # Check aspect ratio (avoid extreme ratios)
             aspect_ratio = max(width, height) / min(width, height)
             if aspect_ratio > 20:
-                logging.warning(f"Extreme aspect ratio: {aspect_ratio:.1f}")
+                logging.warning(f"Extreme aspect ratio: {width}x{height} (ratio={aspect_ratio:.1f} > 20)")
                 return False
+            
             return True
     except Exception as e:
         logging.error(f"Error validating image dimensions: {e}")
