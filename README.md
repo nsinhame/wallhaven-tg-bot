@@ -2,6 +2,13 @@
 
 **Single unified bot that intelligently fetches wallpapers and posts them to Telegram**
 
+## 🌐 Deployment Options
+
+- **☁️ Cloud Deployment (Koyeb)**: [See detailed guide →](KOYEB_DEPLOYMENT.md) - Deploy in 5 minutes!
+- **💻 Local/VPS Deployment**: Follow the Quick Start guide below
+
+---
+
 ## ✨ What's New - Combined Script
 
 The bot now runs **both operations simultaneously**:
@@ -189,6 +196,14 @@ Target: 100 wallpapers (skipping top 0)
 ---
 
 ## 🔧 Advanced Features
+
+### Web Server (Cloud Platform Support)
+- Built-in Flask web server for Koyeb/Heroku/Railway compatibility
+- Health check endpoint: `/health`
+- Statistics endpoint: `/stats`
+- Beautiful status page at root URL
+- Runs on port 8000 (or `PORT` env variable)
+- Zero configuration needed - starts automatically
 
 ### Automatic Category Activation
 - Categories without wallpapers are **auto-scheduled**

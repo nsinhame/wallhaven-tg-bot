@@ -33,6 +33,7 @@ from google.cloud.firestore_v1.base_query import FieldFilter
 from google.api_core.exceptions import ResourceExhausted, RetryError
 from PIL import Image
 import warnings
+from flask import Flask, jsonify, render_template_string
 
 # Configure PIL to handle large images (we validate dimensions separately)
 # Default is ~89MP, increase to 150MP to avoid decompression bomb warnings
@@ -56,6 +57,10 @@ BOT_TOKEN = None
 MAX_REQUESTS_PER_MINUTE = 40
 api_call_times = []
 rate_limit_lock = None  # Will be initialized in main()
+
+# Flask app for Koyeb/cloud platform compatibility
+flask_app = Flask(__name__)
+flask_server_thread = None
 
 # =============================================================================
 # TRIPLE-CACHE ARCHITECTURE FOR FIREBASE OPTIMIZATION
@@ -1040,6 +1045,135 @@ async def enforce_rate_limit():
     # Record this API call
     async with rate_limit_lock:
         api_call_times.append(time.time())
+
+# =============================================================================
+# FLASK WEB SERVER (for Koyeb/cloud platform compatibility)
+# =============================================================================
+
+@flask_app.route('/')
+def home():
+    """Simple home page for cloud platform health checks"""
+    html = '''
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Wallhaven Telegram Bot</title>
+        <style>
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                color: white;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+                padding: 20px;
+                box-sizing: border-box;
+            }
+            .container {
+                text-align: center;
+                background: rgba(255, 255, 255, 0.1);
+                padding: 40px;
+                border-radius: 20px;
+                backdrop-filter: blur(10px);
+                box-shadow: 0 8px 32px 0 rgba(31, 38, 135, 0.37);
+                max-width: 600px;
+            }
+            h1 {
+                font-size: 2.5em;
+                margin-bottom: 20px;
+                text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+            }
+            .emoji {
+                font-size: 3em;
+                margin-bottom: 20px;
+            }
+            p {
+                font-size: 1.2em;
+                line-height: 1.6;
+                margin: 10px 0;
+            }
+            .status {
+                display: inline-block;
+                padding: 10px 20px;
+                background: rgba(76, 175, 80, 0.3);
+                border-radius: 25px;
+                margin-top: 20px;
+                font-weight: bold;
+            }
+            .links {
+                margin-top: 30px;
+            }
+            a {
+                color: #a8dadc;
+                text-decoration: none;
+                margin: 0 10px;
+                font-weight: 500;
+            }
+            a:hover {
+                text-decoration: underline;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="emoji">🤖🎨</div>
+            <h1>Wallhaven Telegram Bot</h1>
+            <p>Your wallpaper automation service is <strong>running smoothly</strong>!</p>
+            <p>Fetching beautiful wallpapers from Wallhaven and posting them to your Telegram groups.</p>
+            <div class="status">✅ Status: Online</div>
+            <div class="links">
+                <a href="/health">Health Check</a>
+                <a href="/stats">Statistics</a>
+            </div>
+        </div>
+    </body>
+    </html>
+    '''
+    return render_template_string(html)
+
+@flask_app.route('/health')
+def health():
+    """Health check endpoint for platform monitoring"""
+    return jsonify({
+        'status': 'healthy',
+        'service': 'wallhaven-telegram-bot',
+        'uptime': time.time() - rate_limit_state.get('period_start', time.time()),
+        'version': '2.0.0'
+    }), 200
+
+@flask_app.route('/stats')
+def stats():
+    """Basic statistics endpoint"""
+    return jsonify({
+        'status': 'running',
+        'rate_limit': {
+            'wallpapers_added': rate_limit_state.get('wallpapers_added', 0),
+            'max_per_period': MAX_WALLPAPERS_PER_PERIOD,
+            'is_paused': rate_limit_state.get('is_paused', False)
+        },
+        'cache': {
+            'hash_cache_file': CACHE_DB_FILE,
+            'firebase_id_cache_file': FIREBASE_ID_CACHE_DB_FILE,
+            'metadata_cache_file': METADATA_CACHE_DB_FILE
+        }
+    }), 200
+
+def run_flask_server():
+    """Run Flask server in a separate thread"""
+    port = int(os.getenv('PORT', 8000))
+    logging.info(f"Starting Flask web server on port {port}...")
+    flask_app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
+def start_flask_server():
+    """Start Flask server in background thread"""
+    global flask_server_thread
+    flask_server_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_server_thread.start()
+    logging.info("✓ Flask web server started in background thread")
 
 # =============================================================================
 # CONFIGURATION LOADERS
@@ -2524,6 +2658,10 @@ async def main():
     logging.info("=" * 70)
     logging.info("Wallhaven Telegram Bot - Combined Fetcher & Poster")
     logging.info("=" * 70)
+    
+    # Start Flask web server for Koyeb/cloud platform compatibility
+    start_flask_server()
+    logging.info("✓ Web server ready for health checks")
     
     # Initialize rate limit lock
     rate_limit_lock = asyncio.Lock()
