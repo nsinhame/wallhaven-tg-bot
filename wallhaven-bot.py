@@ -125,10 +125,6 @@ rate_limit_state = {  # Global rate limit state
 
 FIRESTORE_QUOTA_BACKOFF = 60  # seconds to wait after quota error
 
-# Backoff period for exhausted search terms (7 days in seconds)
-EXHAUSTED_TERM_BACKOFF_DAYS = 7
-EXHAUSTED_TERM_BACKOFF_SECONDS = EXHAUSTED_TERM_BACKOFF_DAYS * 24 * 3600
-
 # Retry decorator for transient failures
 def retry_on_failure(max_attempts=3, delay=2, backoff=2):
     """Retry decorator with exponential backoff"""
@@ -1493,29 +1489,6 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
     skip_count = state['skip_count']
     round_num = state['round']
     
-    # Check if this search term was exhausted recently (within 7 days)
-    exhausted_at = state.get('exhausted_at', 0)
-    if exhausted_at > 0:
-        current_time = int(time.time())
-        time_since_exhausted = current_time - exhausted_at
-        days_since_exhausted = time_since_exhausted / 86400
-        
-        if time_since_exhausted < EXHAUSTED_TERM_BACKOFF_SECONDS:
-            days_remaining = EXHAUSTED_TERM_BACKOFF_DAYS - days_since_exhausted
-            logging.info(f"⏭ [{category}:{search_term}] Skipping - exhausted {days_since_exhausted:.1f} days ago. Will retry in {days_remaining:.1f} days.")
-            return
-        else:
-            # Backoff period expired, clear exhausted status and proceed
-            logging.info(f"🔄 [{category}:{search_term}] Backoff period expired ({days_since_exhausted:.1f} days). Retrying fetch...")
-            try:
-                doc_id = f"{category}_{search_term}".replace(' ', '_').replace('/', '_')
-                state_collection.document(doc_id).update({
-                    "exhausted_at": 0,
-                    "last_updated": int(time.time())
-                })
-            except Exception as e:
-                logging.error(f"Error clearing exhausted status: {e}")
-    
     logging.info("=" * 70)
     logging.info(f"Fetching: {category} → {search_term} | Round {round_num}")
     logging.info(f"Target: {target_count} wallpapers (skipping top {skip_count})")
@@ -1710,31 +1683,6 @@ async def fetch_wallpapers_for_term(wallpaper_collection, state_collection, cate
     # Update state for next round if we reached target
     if added >= target_count:
         update_fetch_state(state_collection, category, search_term)
-        # Clear exhausted status if we successfully added wallpapers
-        try:
-            doc_id = f"{category}_{search_term}".replace(' ', '_').replace('/', '_')
-            state_collection.document(doc_id).update({
-                "exhausted_at": 0,
-                "last_updated": int(time.time())
-            })
-        except Exception as e:
-            logging.error(f"Error clearing exhausted status: {e}")
-    elif no_more_results:
-        # Only mark as exhausted if we added ZERO new wallpapers (truly exhausted)
-        if added == 0:
-            logging.info(f"🚫 [{category}:{search_term}] Search term exhausted (reached last page, 0 new wallpapers).")
-            logging.info(f"   Will skip this term for {EXHAUSTED_TERM_BACKOFF_DAYS} days to save API calls.")
-            try:
-                doc_id = f"{category}_{search_term}".replace(' ', '_').replace('/', '_')
-                state_collection.document(doc_id).update({
-                    "exhausted_at": int(time.time()),
-                    "last_updated": int(time.time())
-                })
-            except Exception as e:
-                logging.error(f"Error marking exhausted state: {e}")
-        else:
-            # Added some wallpapers but reached end - don't mark as exhausted
-            logging.info(f"[{category}:{search_term}] Reached end but added {added} wallpapers. Will continue in next cycle.")
 
 async def wallpaper_fetcher_task(db, api_key, categories):
     """Background task that continuously fetches wallpapers"""
