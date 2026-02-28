@@ -20,6 +20,8 @@ import shutil
 import re
 import sqlite3
 import threading
+import base64
+import tempfile
 from functools import partial, wraps
 from urllib.parse import urlparse
 import requests
@@ -1044,14 +1046,33 @@ async def enforce_rate_limit():
 # =============================================================================
 
 def load_firebase_config():
+    """
+    Load Firebase configuration - supports both Base64 and file path methods
+    """
+    # Check for Base64 credentials first (cloud deployment)
+    credentials_base64 = os.getenv('FIREBASE_CREDENTIALS_BASE64')
+    if credentials_base64:
+        logging.info("Found FIREBASE_CREDENTIALS_BASE64 in environment")
+        return None  # Signal to use Base64 method
+    
+    # Fallback to file path (local development)
     cred_path = os.getenv('FIREBASE_CREDENTIALS')
     if not cred_path:
-        logging.error("FIREBASE_CREDENTIALS not found in environment variables!")
-        logging.error("Please create a .env file with FIREBASE_CREDENTIALS=path/to/serviceAccountKey.json")
+        logging.error("No Firebase credentials found in environment variables!")
+        logging.error("Please set either:")
+        logging.error("  - FIREBASE_CREDENTIALS_BASE64 (for cloud deployment like Koyeb)")
+        logging.error("  - FIREBASE_CREDENTIALS (for local development)")
+        logging.error("")
+        logging.error("To create Base64 credentials:")
+        logging.error("  Windows: [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Content -Path serviceAccountKey.json -Raw)))")
+        logging.error("  Linux/Mac: base64 -w 0 serviceAccountKey.json")
         sys.exit(1)
+    
     if not os.path.exists(cred_path):
         logging.error(f"Firebase credentials file not found: {cred_path}")
+        logging.error("For cloud deployment, use FIREBASE_CREDENTIALS_BASE64 instead")
         sys.exit(1)
+    
     return cred_path
 
 def load_telegram_config():
@@ -1071,25 +1092,71 @@ def load_wallhaven_api_key():
     return api_key
 
 def connect_to_firebase(cred_path):
+    """
+    Connect to Firebase Firestore with support for:
+    1. Base64 encoded credentials (cloud deployment - RECOMMENDED)
+    2. File path credentials (local development)
+    """
     try:
-        logging.info(f"Connecting to Firebase using credentials: {cred_path}")
+        # Check if Firebase is already initialized
         if not firebase_admin._apps:
             logging.info("Initializing Firebase Admin SDK...")
-            cred = credentials.Certificate(cred_path)
-            firebase_admin.initialize_app(cred)
-            logging.info("✓ Firebase Admin SDK initialized")
+            
+            # OPTION 1: Try Base64 encoded credentials first (for cloud platforms like Koyeb)
+            credentials_base64 = os.getenv('FIREBASE_CREDENTIALS_BASE64')
+            if credentials_base64:
+                try:
+                    logging.info("Attempting to load Firebase credentials from Base64 environment variable...")
+                    # Decode base64 to JSON string
+                    credentials_json = base64.b64decode(credentials_base64).decode('utf-8')
+                    credentials_dict = json.loads(credentials_json)
+                    
+                    # Initialize with dictionary
+                    cred = credentials.Certificate(credentials_dict)
+                    firebase_admin.initialize_app(cred)
+                    logging.info("✓ Firebase Admin SDK initialized from Base64 credentials")
+                    logging.info("✓ Base64 credentials method is perfect for cloud deployment!")
+                except Exception as e:
+                    logging.error(f"Failed to initialize Firebase from Base64: {e}")
+                    logging.error("Falling back to file path method...")
+                    credentials_base64 = None  # Clear flag to try file path
+            
+            # OPTION 2: Fallback to file path (for local development)
+            if not credentials_base64:
+                if not cred_path:
+                    logging.error("No Firebase credentials found!")
+                    logging.error("Please set either:")
+                    logging.error("  - FIREBASE_CREDENTIALS_BASE64 (for cloud deployment)")
+                    logging.error("  - FIREBASE_CREDENTIALS (for local development)")
+                    sys.exit(1)
+                
+                if not os.path.exists(cred_path):
+                    logging.error(f"Firebase credentials file not found: {cred_path}")
+                    logging.error("Please ensure the FIREBASE_CREDENTIALS path is correct in your .env file")
+                    sys.exit(1)
+                
+                logging.info(f"Connecting to Firebase using credentials file: {cred_path}")
+                cred = credentials.Certificate(cred_path)
+                firebase_admin.initialize_app(cred)
+                logging.info("✓ Firebase Admin SDK initialized from file")
+        
         logging.info("Creating Firestore client...")
         db = firestore.client()
         logging.info("✓ Connected to Firebase Firestore")
         return db
+        
     except FileNotFoundError as e:
         logging.error(f"Firebase credentials file not found: {cred_path}")
         logging.error("Please ensure the FIREBASE_CREDENTIALS path is correct in your .env file")
         sys.exit(1)
+    except json.JSONDecodeError as e:
+        logging.error(f"Invalid JSON in Firebase credentials: {e}")
+        logging.error("Please check your Base64 encoded credentials or JSON file")
+        sys.exit(1)
     except Exception as e:
         logging.error(f"Failed to connect to Firebase: {e}")
         logging.error("This could be due to:")
-        logging.error("  - Invalid credentials file")
+        logging.error("  - Invalid credentials file or Base64 string")
         logging.error("  - Network connectivity issues")
         logging.error("  - Firestore not enabled in your Firebase project")
         sys.exit(1)
