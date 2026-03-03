@@ -113,7 +113,7 @@ metadata_cache_conn = None  # Metadata database connection
 metadata_cache_lock = None  # Thread lock for metadata database access
 
 # Rate limiting for database writes (prevent Firebase quota exhaustion)
-MAX_WALLPAPERS_PER_PERIOD = 10000  # Maximum new wallpapers to add per period
+MAX_WALLPAPERS_PER_PERIOD = 5000  # Maximum new wallpapers to add per period
 RATE_LIMIT_PERIOD_HOURS = 28  # Period duration in hours
 rate_limit_state = {  # Global rate limit state
     'period_start': 0,
